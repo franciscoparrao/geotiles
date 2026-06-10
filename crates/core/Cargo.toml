@@ -1,0 +1,24 @@
+[package]
+name = "geotiles-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Tile pyramid math, rendering and MBTiles packaging for geotiles"
+keywords.workspace = true
+categories = ["science::geo"]
+
+[features]
+default = ["parallel"]
+parallel = ["dep:rayon", "surtgis-core/parallel"]
+
+[dependencies]
+thiserror.workspace = true
+surtgis-core.workspace = true
+surtgis-colormap.workspace = true
+rusqlite.workspace = true
+rayon = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,79 @@
+<!doctype html>
+<!--
+  Visor mínimo para inspeccionar una pirámide XYZ generada por geotiles.
+
+  Uso:
+    geotiles raster dem.tif -o tiles/ --scheme terrain
+    python3 -m http.server 8000        # desde este directorio
+    abrir http://localhost:8000/viewer.html?tiles=tiles
+
+  El parámetro ?tiles= apunta al directorio raíz de la pirámide (relativo
+  al servidor). Lee metadata.json para centrar el mapa y fijar los zooms.
+-->
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>geotiles viewer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
+  <link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet" />
+  <style>
+    html, body, #map { margin: 0; height: 100%; }
+    #info {
+      position: absolute; top: 8px; left: 8px; z-index: 1;
+      background: rgba(255,255,255,.9); padding: 6px 10px;
+      font: 13px/1.4 system-ui, sans-serif; border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="info">cargando metadata…</div>
+  <script>
+    const tilesRoot = new URLSearchParams(location.search).get('tiles') || 'tiles';
+
+    fetch(`${tilesRoot}/metadata.json`)
+      .then(r => r.ok ? r.json() : Promise.reject(r.status))
+      .then(meta => {
+        const [w, s, e, n] = meta.bounds;
+        document.getElementById('info').textContent =
+          `${meta.name} — z${meta.minzoom}–${meta.maxzoom}`;
+
+        const map = new maplibregl.Map({
+          container: 'map',
+          style: {
+            version: 8,
+            sources: {
+              osm: {
+                type: 'raster',
+                tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+                tileSize: 256,
+                attribution: '© OpenStreetMap'
+              },
+              geotiles: {
+                type: 'raster',
+                tiles: [`${tilesRoot}/{z}/{x}/{y}.png`],
+                tileSize: 256,
+                minzoom: meta.minzoom,
+                maxzoom: meta.maxzoom,
+                bounds: meta.bounds
+              }
+            },
+            layers: [
+              { id: 'osm', type: 'raster', source: 'osm' },
+              { id: 'geotiles', type: 'raster', source: 'geotiles',
+                paint: { 'raster-opacity': 0.85 } }
+            ]
+          },
+          bounds: [[w, s], [e, n]],
+          fitBoundsOptions: { padding: 40 }
+        });
+        map.addControl(new maplibregl.NavigationControl());
+      })
+      .catch(err => {
+        document.getElementById('info').textContent =
+          `no se pudo leer ${tilesRoot}/metadata.json (${err})`;
+      });
+  </script>
+</body>
+</html>

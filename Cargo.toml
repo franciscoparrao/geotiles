@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Francisco Parra"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/franciscoparrao/geotiles"
+description = "Web map tile generation in Rust: XYZ pyramids and MBTiles from geospatial rasters"
+keywords = ["gis", "geospatial", "tiles", "mbtiles", "raster"]
+categories = ["science::geo", "command-line-utilities"]
+
+[workspace.dependencies]
+thiserror = "2"
+anyhow = "1"
+
+# Ecosystem reuse (SurtGIS)
+surtgis-core = { version = "0.15", path = "../surtgis/crates/core", default-features = false }
+surtgis-colormap = { version = "0.15", path = "../surtgis/crates/colormap" }
+
+# Storage
+rusqlite = { version = "0.33", features = ["bundled"] }
+
+# Parallelism
+rayon = "1.10"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.17"
+
+[profile.release]
+lto = true
+codegen-units = 1

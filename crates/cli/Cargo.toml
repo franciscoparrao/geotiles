@@ -1,0 +1,22 @@
+[package]
+name = "geotiles"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI for generating XYZ tile pyramids and MBTiles from geospatial rasters"
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "geotiles"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+indicatif.workspace = true
+geotiles-core = { version = "0.1", path = "../core" }
+surtgis-core.workspace = true
+surtgis-colormap.workspace = true
