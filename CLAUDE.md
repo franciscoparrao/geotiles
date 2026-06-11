@@ -13,10 +13,12 @@ SurtGIS lee COG y hace STAC, pero no **publica** datos para web. El campo es
 **tippecanoe** (C++), gdal2tiles (lento), mbutil. Infra reutilizable para todas
 tus webs SvelteKit.
 
-## Alcance MVP (v0.1)
+## Alcance MVP (v0.1) — COMPLETO
 - [x] Raster → teselas XYZ (PNG) con remuestreo (nearest/bilinear) y pirámide.
-- [ ] Escritura COG (complementa el lector COG de SurtGIS).
+- [x] Escritura COG (writer TIFF propio: Float32, deflate, overviews 2×;
+      pasa el validador oficial de GDAL). Complementa el lector COG de SurtGIS.
 - [x] Empaquetado MBTiles (SQLite, rusqlite bundled).
+- [x] Promedio de área en zooms overview (sin tiles vacíos en zooms bajos).
 - [ ] (v0.2) Vector tiles MVT desde GeoJSON/GPKG; simplificación por zoom.
 - [ ] WebP como formato alternativo de tile.
 
@@ -46,14 +48,13 @@ Comparar salidas contra **tippecanoe**/gdal2tiles (visual + estructura MBTiles).
 
 ## Limitaciones conocidas v0.1
 - Solo entradas EPSG:4326/3857 (sin motor de reproyección; usar gdalwarp).
-- Point-sampling en centros de píxel: en zooms muy bajos un raster chico
-  puede caer entre muestras → tiles vacíos (z0/z2 en el smoke test).
-  Pendiente: overviews por promedio de área.
 - Una banda por corrida; RGB(A) pendiente.
+- COG siempre Float32 single-band (byte/RGB pendiente junto con RGB(A)).
 
 ## Próximos pasos al retomar
-1. Overviews por promedio de área (downsampling desde el zoom base, no
-   point-sampling por zoom) — corrige tiles vacíos en zooms bajos.
-2. Escritura COG (cierra el ítem MVP restante).
-3. Soporte RGB(A) de 3–4 bandas (write_geotiff_multiband ya existe en SurtGIS).
-4. Evaluar MVT para v0.2.
+1. Soporte RGB(A) de 3–4 bandas en pirámide y COG byte
+   (write_geotiff_multiband ya existe en SurtGIS).
+2. Evaluar MVT para v0.2 (geozero + simplificación por zoom; comparar
+   contra tippecanoe).
+3. WebP como formato de tile alternativo.
+4. Considerar release 0.1.0 a crates.io cuando RGB(A) esté dentro.

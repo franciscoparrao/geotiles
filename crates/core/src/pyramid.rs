@@ -83,13 +83,23 @@ fn render_tile(
     let res = crate::mercator::resolution(coord.z, tile_size);
     let n = tile_size as usize;
 
+    // At overview zooms one output pixel spans several source cells; point
+    // sampling would skip most of the data (or all of it, for a raster
+    // smaller than the pixel spacing). Switch to area averaging there.
+    let area_average = res > 2.0 * source.native_resolution_m();
+
     let mut tile = Raster::filled(n, n, f64::NAN);
     let mut any_valid = false;
     for i in 0..n {
         let my = max_y - (i as f64 + 0.5) * res;
         for j in 0..n {
             let mx = min_x + (j as f64 + 0.5) * res;
-            if let Some(v) = source.sample(mx, my, resampling) {
+            let sampled = if area_average {
+                source.sample_area(mx - res / 2.0, my - res / 2.0, mx + res / 2.0, my + res / 2.0)
+            } else {
+                source.sample(mx, my, resampling)
+            };
+            if let Some(v) = sampled {
                 // Raster::set on freshly allocated grid cannot fail in-bounds.
                 let _ = tile.set(i, j, v);
                 any_valid = true;
@@ -336,6 +346,37 @@ mod tests {
         let mut sink = MemSink::new();
         let stats = generate(&src, &opts, &mut sink, |_| {}).unwrap();
         assert_eq!(counted, stats.written + stats.skipped);
+    }
+
+    #[test]
+    fn small_raster_covers_every_low_zoom() {
+        // A raster much smaller than a z0..z4 pixel: with point sampling it
+        // fell between pixel centers and produced empty low-zoom tiles.
+        let n = 32;
+        let mut r = Raster::new(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                r.set(i, j, (i + j) as f64).unwrap();
+            }
+        }
+        // ~0.06° wide near Valparaíso.
+        r.set_transform(GeoTransform::new(-71.5, -32.8, 0.002, -0.002));
+        r.set_crs(Some(CRS::from_epsg(4326)));
+        let src = RasterSource::new(r, None).unwrap();
+
+        let opts = PyramidOptions {
+            min_zoom: Some(0),
+            max_zoom: Some(6),
+            ..Default::default()
+        };
+        let mut sink = MemSink::new();
+        generate(&src, &opts, &mut sink, |_| {}).unwrap();
+        for z in 0..=6u8 {
+            assert!(
+                sink.tiles.keys().any(|&(tz, _, _)| tz == z),
+                "zoom {z} has no tiles"
+            );
+        }
     }
 
     #[test]

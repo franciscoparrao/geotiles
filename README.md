@@ -12,7 +12,8 @@ v0.1 (raster pipeline). Vector tiles (MVT) and COG writing are planned.
 - [x] MBTiles 1.3 packaging (SQLite, TMS row order)
 - [x] 16 colour schemes (terrain, grayscale, NDVI, Imhof relief, …) via `surtgis-colormap`
 - [x] Parallel rendering (rayon) with a single writer thread
-- [ ] COG writing
+- [x] Area-averaged sampling at overview zooms (no empty low-zoom tiles)
+- [x] COG writing (Float32, deflate, 2× overviews; passes GDAL's COG validator)
 - [ ] Vector tiles (MVT) from GeoJSON/GPKG
 
 ## Usage
@@ -29,6 +30,9 @@ geotiles raster dem.tif -o tiles/ --min-zoom 8 --max-zoom 14 --range 0,2500
 
 # Available colour schemes
 geotiles raster --list-schemes x -o x
+
+# Rewrite as Cloud Optimized GeoTIFF (Float32 + internal overviews)
+geotiles cog dem.tif -o dem_cog.tif
 ```
 
 Inputs must be in EPSG:4326 or EPSG:3857 (`--source-crs` overrides
@@ -49,7 +53,8 @@ crates/
 │   ├── source.rs     RasterSource: CRS detection, nearest/bilinear sampling
 │   ├── pyramid.rs    tile rendering + rayon orchestration, TileSink trait
 │   ├── xyz.rs        z/x/y.png directory sink
-│   └── mbtiles.rs    MBTiles 1.3 sink (rusqlite, bundled)
+│   ├── mbtiles.rs    MBTiles 1.3 sink (rusqlite, bundled)
+│   └── cog.rs        Cloud Optimized GeoTIFF writer (own TIFF encoder)
 └── cli/    geotiles binary (clap)
 ```
 
@@ -61,12 +66,10 @@ pulled from crates.io, so the repo builds standalone.
 
 ## Known limitations (v0.1)
 
-- Pixel-center point sampling: at very low zooms a small raster can fall
-  between sample points, leaving some low-zoom tiles empty (e.g. z0/z2
-  present no tile while z1 does). Viewers handle missing overlay tiles
-  gracefully; area-averaged overviews are planned.
 - Single-band sources only; RGB(A) GeoTIFF support is planned.
 - No reprojection engine: only EPSG:4326 / EPSG:3857 inputs.
+- COG output is always Float32 single band (matches the analysis-raster
+  use case; byte/RGB COGs are planned together with RGB(A) tiling).
 
 ## Validation
 

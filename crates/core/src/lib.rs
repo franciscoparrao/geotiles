@@ -25,6 +25,7 @@
 //! # }
 //! ```
 
+pub mod cog;
 pub mod error;
 pub mod mbtiles;
 pub mod mercator;
@@ -32,6 +33,7 @@ pub mod pyramid;
 pub mod source;
 pub mod xyz;
 
+pub use cog::{CogCompression, CogInfo, CogOptions, write_cog};
 pub use error::{Error, Result};
 pub use mbtiles::MbtilesSink;
 pub use mercator::{TileCoord, TileRange};

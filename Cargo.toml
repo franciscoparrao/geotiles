@@ -25,6 +25,7 @@ surtgis-colormap = "0.15.4"
 
 # Storage
 rusqlite = { version = "0.33", features = ["bundled"] }
+flate2 = "1"
 
 # Parallelism
 rayon = "1.10"

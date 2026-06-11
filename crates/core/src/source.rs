@@ -161,6 +161,58 @@ impl RasterSource {
         }
     }
 
+    /// Average the valid cells whose centers fall inside a Web Mercator
+    /// rectangle `(mx0, my0, mx1, my1)`.
+    ///
+    /// This is the area-average used for overview zooms, where one output
+    /// pixel covers many source cells and point sampling would miss data.
+    /// Falls back to bilinear at the rectangle center when the footprint is
+    /// smaller than one cell.
+    pub fn sample_area(&self, mx0: f64, my0: f64, mx1: f64, my1: f64) -> Option<f64> {
+        let ((sx0, sy0), (sx1, sy1)) = match self.crs {
+            SourceCrs::Mercator => ((mx0, my0), (mx1, my1)),
+            SourceCrs::LonLat => (
+                mercator::meters_to_lonlat(mx0, my0),
+                mercator::meters_to_lonlat(mx1, my1),
+            ),
+        };
+        let (ca, ra) = self.raster.geo_to_pixel(sx0.min(sx1), sy0.max(sy1));
+        let (cb, rb) = self.raster.geo_to_pixel(sx0.max(sx1), sy0.min(sy1));
+        if !ca.is_finite() || !cb.is_finite() || !ra.is_finite() || !rb.is_finite() {
+            return None;
+        }
+        // Cell centers sit at fractional +0.5: center of cell c is inside
+        // [ca, cb] iff c ∈ [ceil(ca - 0.5), floor(cb - 0.5)].
+        let col_start = (ca.min(cb) - 0.5).ceil() as i64;
+        let col_end = (ca.max(cb) - 0.5).floor() as i64;
+        let row_start = (ra.min(rb) - 0.5).ceil() as i64;
+        let row_end = (ra.max(rb) - 0.5).floor() as i64;
+
+        if col_start > col_end || row_start > row_end {
+            // Footprint narrower than a cell: behave like point sampling.
+            return self.sample((mx0 + mx1) / 2.0, (my0 + my1) / 2.0, Resampling::Bilinear);
+        }
+
+        // Intersect with the raster so footprints that poke outside don't
+        // iterate over (possibly millions of) nonexistent cells.
+        let col_start = col_start.max(0);
+        let col_end = col_end.min(self.raster.cols() as i64 - 1);
+        let row_start = row_start.max(0);
+        let row_end = row_end.min(self.raster.rows() as i64 - 1);
+
+        let mut acc = 0.0;
+        let mut count = 0u64;
+        for row in row_start..=row_end {
+            for col in col_start..=col_end {
+                if let Some(v) = self.valid_at(row, col) {
+                    acc += v;
+                    count += 1;
+                }
+            }
+        }
+        (count > 0).then(|| acc / count as f64)
+    }
+
     fn valid_at(&self, row: i64, col: i64) -> Option<f64> {
         if row < 0 || col < 0 || row >= self.raster.rows() as i64 || col >= self.raster.cols() as i64
         {
@@ -291,6 +343,43 @@ mod tests {
         // A bilinear sample next to the hole still returns data (renormalized).
         let (mx, my) = mercator::lonlat_to_meters(1.9, 3.5);
         assert!(src.sample(mx, my, Resampling::Bilinear).is_some());
+    }
+
+    #[test]
+    fn area_average_over_whole_raster_is_mean() {
+        let src = RasterSource::new(lonlat_raster(), None).unwrap();
+        let (mx0, my0) = mercator::lonlat_to_meters(0.0, 0.0);
+        let (mx1, my1) = mercator::lonlat_to_meters(4.0, 4.0);
+        let v = src.sample_area(mx0, my0, mx1, my1).unwrap();
+        // Mean of row*10+col over 4×4 = mean(rows)*10 + mean(cols) = 16.5.
+        assert!((v - 16.5).abs() < 1e-9, "got {v}");
+    }
+
+    #[test]
+    fn area_average_ignores_nodata() {
+        let mut r = lonlat_raster();
+        r.set_nodata(Some(-9999.0));
+        for col in 0..4 {
+            for row in 0..4 {
+                if !(row == 0 && col == 0) {
+                    r.set(row, col, -9999.0).unwrap();
+                }
+            }
+        }
+        let src = RasterSource::new(r, None).unwrap();
+        let (mx0, my0) = mercator::lonlat_to_meters(0.0, 0.0);
+        let (mx1, my1) = mercator::lonlat_to_meters(4.0, 4.0);
+        // Only cell (0,0)=0.0 is valid.
+        assert_eq!(src.sample_area(mx0, my0, mx1, my1), Some(0.0));
+    }
+
+    #[test]
+    fn area_average_sub_cell_footprint_falls_back_to_point() {
+        let src = RasterSource::new(lonlat_raster(), None).unwrap();
+        // Tiny footprint centered on cell (3,0)'s center.
+        let (mx, my) = mercator::lonlat_to_meters(0.5, 0.5);
+        let v = src.sample_area(mx - 1.0, my - 1.0, mx + 1.0, my + 1.0).unwrap();
+        assert!((v - 30.0).abs() < 1e-9, "got {v}");
     }
 
     #[test]

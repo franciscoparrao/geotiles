@@ -7,8 +7,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use geotiles_core::{
-    ColorScheme, MbtilesSink, PyramidOptions, RasterSource, Resampling, SourceCrs, XyzSink,
-    count_tiles, generate,
+    CogCompression, CogOptions, ColorScheme, MbtilesSink, PyramidOptions, RasterSource,
+    Resampling, SourceCrs, XyzSink, count_tiles, generate, write_cog,
 };
 
 #[derive(Parser)]
@@ -25,6 +25,26 @@ enum Command {
     /// The output kind is inferred from -o: a path ending in .mbtiles
     /// produces an MBTiles file, anything else an XYZ directory.
     Raster(RasterArgs),
+    /// Rewrite a raster as a Cloud Optimized GeoTIFF (Float32 + overviews).
+    Cog {
+        /// Input raster (GeoTIFF) in EPSG:4326 or EPSG:3857.
+        input: PathBuf,
+        /// Output COG path.
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Internal tile size in pixels (multiple of 16).
+        #[arg(long, default_value_t = 512)]
+        tile_size: u32,
+        /// Disable deflate compression.
+        #[arg(long)]
+        no_compression: bool,
+        /// Override CRS detection.
+        #[arg(long, value_enum)]
+        source_crs: Option<CrsArg>,
+        /// Band to convert (1-based).
+        #[arg(long, default_value_t = 1)]
+        band: usize,
+    },
     /// Show tiling-relevant information about a raster.
     Info {
         /// Input raster (GeoTIFF).
@@ -194,6 +214,32 @@ fn cmd_raster(args: RasterArgs) -> Result<()> {
     Ok(())
 }
 
+fn cmd_cog(
+    input: &Path,
+    output: &Path,
+    tile_size: u32,
+    no_compression: bool,
+    source_crs: Option<SourceCrs>,
+    band: usize,
+) -> Result<()> {
+    let raster = surtgis_core::io::read_geotiff::<f64, _>(input, Some(band))
+        .with_context(|| format!("reading {}", input.display()))?;
+    let opts = CogOptions {
+        tile_size,
+        compression: if no_compression { CogCompression::None } else { CogCompression::Deflate },
+        crs: source_crs,
+    };
+    let info = write_cog(&raster, output, &opts)?;
+    println!(
+        "COG: {} levels, {} tiles, {:.1} MiB → {}",
+        info.levels,
+        info.tiles,
+        info.file_size as f64 / (1024.0 * 1024.0),
+        output.display()
+    );
+    Ok(())
+}
+
 fn cmd_info(input: &Path, band: usize) -> Result<()> {
     let source = load_source(input, band, None)?;
     let raster = source.raster();
@@ -221,6 +267,9 @@ fn cmd_info(input: &Path, band: usize) -> Result<()> {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Raster(args) => cmd_raster(args),
+        Command::Cog { input, output, tile_size, no_compression, source_crs, band } => {
+            cmd_cog(&input, &output, tile_size, no_compression, source_crs.map(Into::into), band)
+        }
         Command::Info { input, band } => cmd_info(&input, band),
     }
 }

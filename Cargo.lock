@@ -415,6 +415,7 @@ dependencies = [
 name = "geotiles-core"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "rayon",
  "rusqlite",
  "surtgis-colormap",
