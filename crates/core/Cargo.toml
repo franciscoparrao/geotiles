@@ -19,6 +19,7 @@ surtgis-core.workspace = true
 surtgis-colormap.workspace = true
 rusqlite.workspace = true
 flate2.workspace = true
+tiff.workspace = true
 rayon = { workspace = true, optional = true }
 
 [dev-dependencies]

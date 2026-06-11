@@ -27,14 +27,16 @@
 
 pub mod cog;
 pub mod error;
+pub mod io;
 pub mod mbtiles;
 pub mod mercator;
 pub mod pyramid;
 pub mod source;
 pub mod xyz;
 
-pub use cog::{CogCompression, CogInfo, CogOptions, write_cog};
+pub use cog::{CogCompression, CogInfo, CogOptions, write_cog, write_cog_rgb};
 pub use error::{Error, Result};
+pub use io::{band_count, read_bands};
 pub use mbtiles::MbtilesSink;
 pub use mercator::{TileCoord, TileRange};
 pub use pyramid::{

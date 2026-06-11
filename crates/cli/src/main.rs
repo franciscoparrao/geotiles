@@ -8,7 +8,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use geotiles_core::{
     CogCompression, CogOptions, ColorScheme, MbtilesSink, PyramidOptions, RasterSource,
-    Resampling, SourceCrs, XyzSink, count_tiles, generate, write_cog,
+    Resampling, SourceCrs, XyzSink, count_tiles, generate, write_cog, write_cog_rgb,
 };
 
 #[derive(Parser)]
@@ -41,17 +41,18 @@ enum Command {
         /// Override CRS detection.
         #[arg(long, value_enum)]
         source_crs: Option<CrsArg>,
-        /// Band to convert (1-based).
-        #[arg(long, default_value_t = 1)]
-        band: usize,
+        /// Bands to convert, 1-based: one band (Float32 COG) or 3-4
+        /// (byte RGB/RGBA COG), e.g. --bands 1,2,3.
+        #[arg(long, default_value = "1", value_delimiter = ',')]
+        bands: Vec<usize>,
+        /// Stretch for RGB byte output as MIN,MAX (default 0,255).
+        #[arg(long, value_parser = parse_range)]
+        range: Option<(f64, f64)>,
     },
     /// Show tiling-relevant information about a raster.
     Info {
         /// Input raster (GeoTIFF).
         input: PathBuf,
-        /// Band to inspect (1-based).
-        #[arg(long, default_value_t = 1)]
-        band: usize,
     },
 }
 
@@ -86,9 +87,10 @@ struct RasterArgs {
     /// Override CRS detection.
     #[arg(long, value_enum)]
     source_crs: Option<CrsArg>,
-    /// Band to tile (1-based).
-    #[arg(long, default_value_t = 1)]
-    band: usize,
+    /// Bands to tile, 1-based: one band (colour scheme applied) or 3-4
+    /// bands rendered as RGB(A), e.g. --bands 4,3,2.
+    #[arg(long, default_value = "1", value_delimiter = ',')]
+    bands: Vec<usize>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -152,10 +154,18 @@ fn scheme_names() -> Vec<String> {
     ColorScheme::ALL.iter().map(|s| s.name().to_lowercase()).collect()
 }
 
-fn load_source(input: &Path, band: usize, crs: Option<SourceCrs>) -> Result<RasterSource> {
-    let raster = surtgis_core::io::read_geotiff::<f64, _>(input, Some(band))
+fn validate_band_selection(bands: &[usize]) -> Result<()> {
+    if !matches!(bands.len(), 1 | 3 | 4) {
+        anyhow::bail!("--bands takes 1 (gray), 3 (RGB) or 4 (RGBA) bands, got {}", bands.len());
+    }
+    Ok(())
+}
+
+fn load_source(input: &Path, bands: &[usize], crs: Option<SourceCrs>) -> Result<RasterSource> {
+    validate_band_selection(bands)?;
+    let rasters = geotiles_core::read_bands(input, Some(bands))
         .with_context(|| format!("reading {}", input.display()))?;
-    RasterSource::new(raster, crs).context("preparing raster source")
+    RasterSource::new_multi(rasters, crs).context("preparing raster source")
 }
 
 fn cmd_raster(args: RasterArgs) -> Result<()> {
@@ -164,7 +174,7 @@ fn cmd_raster(args: RasterArgs) -> Result<()> {
         return Ok(());
     }
 
-    let source = load_source(&args.input, args.band, args.source_crs.map(Into::into))?;
+    let source = load_source(&args.input, &args.bands, args.source_crs.map(Into::into))?;
     let name = args.name.clone().unwrap_or_else(|| {
         args.input
             .file_stem()
@@ -214,24 +224,32 @@ fn cmd_raster(args: RasterArgs) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_cog(
     input: &Path,
     output: &Path,
     tile_size: u32,
     no_compression: bool,
     source_crs: Option<SourceCrs>,
-    band: usize,
+    bands: &[usize],
+    range: Option<(f64, f64)>,
 ) -> Result<()> {
-    let raster = surtgis_core::io::read_geotiff::<f64, _>(input, Some(band))
+    validate_band_selection(bands)?;
+    let rasters = geotiles_core::read_bands(input, Some(bands))
         .with_context(|| format!("reading {}", input.display()))?;
     let opts = CogOptions {
         tile_size,
         compression: if no_compression { CogCompression::None } else { CogCompression::Deflate },
         crs: source_crs,
     };
-    let info = write_cog(&raster, output, &opts)?;
+    let info = if rasters.len() == 1 {
+        write_cog(&rasters[0], output, &opts)?
+    } else {
+        write_cog_rgb(&rasters, output, &opts, range)?
+    };
     println!(
-        "COG: {} levels, {} tiles, {:.1} MiB → {}",
+        "COG ({}): {} levels, {} tiles, {:.1} MiB → {}",
+        if rasters.len() == 1 { "Float32" } else { "byte RGB(A)" },
         info.levels,
         info.tiles,
         info.file_size as f64 / (1024.0 * 1024.0),
@@ -240,13 +258,15 @@ fn cmd_cog(
     Ok(())
 }
 
-fn cmd_info(input: &Path, band: usize) -> Result<()> {
-    let source = load_source(input, band, None)?;
+fn cmd_info(input: &Path) -> Result<()> {
+    let n_bands = geotiles_core::band_count(input)
+        .with_context(|| format!("reading {}", input.display()))?;
+    let source = load_source(input, &[1], None)?;
     let raster = source.raster();
     let (w, s, e, n) = source.bounds_lonlat();
 
     println!("input        : {}", input.display());
-    println!("size         : {} cols × {} rows", raster.cols(), raster.rows());
+    println!("size         : {} cols × {} rows × {} band(s)", raster.cols(), raster.rows(), n_bands);
     println!(
         "crs          : {}",
         match source.crs() {
@@ -267,9 +287,17 @@ fn cmd_info(input: &Path, band: usize) -> Result<()> {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Raster(args) => cmd_raster(args),
-        Command::Cog { input, output, tile_size, no_compression, source_crs, band } => {
-            cmd_cog(&input, &output, tile_size, no_compression, source_crs.map(Into::into), band)
+        Command::Cog { input, output, tile_size, no_compression, source_crs, bands, range } => {
+            cmd_cog(
+                &input,
+                &output,
+                tile_size,
+                no_compression,
+                source_crs.map(Into::into),
+                &bands,
+                range,
+            )
         }
-        Command::Info { input, band } => cmd_info(&input, band),
+        Command::Info { input } => cmd_info(&input),
     }
 }

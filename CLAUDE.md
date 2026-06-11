@@ -48,13 +48,24 @@ Comparar salidas contra **tippecanoe**/gdal2tiles (visual + estructura MBTiles).
 
 ## Limitaciones conocidas v0.1
 - Solo entradas EPSG:4326/3857 (sin motor de reproyección; usar gdalwarp).
-- Una banda por corrida; RGB(A) pendiente.
-- COG siempre Float32 single-band (byte/RGB pendiente junto con RGB(A)).
+- Stretch RGB con un solo --range global para todas las bandas.
+- Lector multibanda decodifica la imagen completa en RAM (igual que el
+  lector nativo de surtgis); streaming queda para v0.2.
+
+## Notas de implementación RGB(A) (2026-06-11)
+- io.rs: lector multibanda propio sobre el crate tiff — el lector nativo
+  de surtgis-core NO soporta multibanda (su parámetro band es no-op y RGB
+  falla por dimensiones). Candidato a contribución upstream a surtgis.
+- RasterSource ahora contiene 1/3/4 bandas co-registradas;
+  sample_band/sample_area_band por banda.
+- pyramid.rs: enum Shader interno (Colormap | Rgb); RGB stretch lineal a
+  0-255, nodata→transparente, banda 4 = alpha.
+- cog.rs: write_pyramid compartido parametrizado por SampleSpec;
+  write_cog_rgb produce byte RGB(A) interleaved con ExtraSamples=2.
 
 ## Próximos pasos al retomar
-1. Soporte RGB(A) de 3–4 bandas en pirámide y COG byte
-   (write_geotiff_multiband ya existe en SurtGIS).
-2. Evaluar MVT para v0.2 (geozero + simplificación por zoom; comparar
+1. Evaluar MVT para v0.2 (geozero + simplificación por zoom; comparar
    contra tippecanoe).
-3. WebP como formato de tile alternativo.
-4. Considerar release 0.1.0 a crates.io cuando RGB(A) esté dentro.
+2. WebP como formato de tile alternativo.
+3. Considerar release 0.1.0 a crates.io (MVP + RGB(A) completos).
+4. Contribuir lectura multibanda upstream a surtgis-core (band es no-op).

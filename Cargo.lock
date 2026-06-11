@@ -422,6 +422,7 @@ dependencies = [
  "surtgis-core",
  "tempfile",
  "thiserror",
+ "tiff",
 ]
 
 [[package]]

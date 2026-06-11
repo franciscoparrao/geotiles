@@ -70,56 +70,142 @@ pub trait TileSink {
     fn finalize(&mut self, meta: &PyramidMetadata) -> Result<()>;
 }
 
-/// Render one tile as a `tile_size²` raster of sampled values (NaN = empty).
-///
-/// Returns `None` when every pixel falls outside the source or on nodata.
-fn render_tile(
+/// How sampled band values become RGBA pixels.
+enum Shader {
+    /// Single band through a colour scheme.
+    Colormap(ColormapParams),
+    /// 3 (RGB) or 4 (RGBA) bands stretched linearly onto 0..255.
+    Rgb { lo: f64, inv_span: f64 },
+}
+
+/// Sample one band over the tile grid; `f(j, i, value)` receives each hit.
+fn sample_grid<F: FnMut(usize, usize, f64)>(
     source: &RasterSource,
+    band: usize,
     coord: TileCoord,
     tile_size: u32,
     resampling: Resampling,
-) -> Option<Raster<f64>> {
+    area_average: bool,
+    mut f: F,
+) {
     let (min_x, _, _, max_y) = coord.bounds_meters();
     let res = crate::mercator::resolution(coord.z, tile_size);
     let n = tile_size as usize;
-
-    // At overview zooms one output pixel spans several source cells; point
-    // sampling would skip most of the data (or all of it, for a raster
-    // smaller than the pixel spacing). Switch to area averaging there.
-    let area_average = res > 2.0 * source.native_resolution_m();
-
-    let mut tile = Raster::filled(n, n, f64::NAN);
-    let mut any_valid = false;
     for i in 0..n {
         let my = max_y - (i as f64 + 0.5) * res;
         for j in 0..n {
             let mx = min_x + (j as f64 + 0.5) * res;
             let sampled = if area_average {
-                source.sample_area(mx - res / 2.0, my - res / 2.0, mx + res / 2.0, my + res / 2.0)
+                source.sample_area_band(
+                    band,
+                    mx - res / 2.0,
+                    my - res / 2.0,
+                    mx + res / 2.0,
+                    my + res / 2.0,
+                )
             } else {
-                source.sample(mx, my, resampling)
+                source.sample_band(band, mx, my, resampling)
             };
             if let Some(v) = sampled {
-                // Raster::set on freshly allocated grid cannot fail in-bounds.
-                let _ = tile.set(i, j, v);
-                any_valid = true;
+                f(j, i, v);
             }
         }
     }
-    any_valid.then_some(tile)
 }
 
-/// Encode a sampled tile to PNG using the colour parameters.
-fn encode_tile(tile: &Raster<f64>, params: &ColormapParams, tile_size: u32) -> Result<Vec<u8>> {
-    let rgba = raster_to_rgba(tile, params);
-    rgba_to_png_bytes(tile_size, tile_size, &rgba).map_err(|e| Error::Encode(e.to_string()))
-}
-
-/// Resolve the effective zoom range and colour parameters for a run.
-fn resolve(
+/// Render a 3/4-band source straight to an RGBA buffer.
+///
+/// Channel values are stretched linearly from `[lo, lo + 1/inv_span]` to
+/// 0..255. Pixels where any colour band is missing become transparent; a
+/// fourth band, when present, is used as the alpha channel.
+fn render_tile_rgb(
     source: &RasterSource,
-    opts: &PyramidOptions,
-) -> Result<(u8, u8, ColormapParams)> {
+    coord: TileCoord,
+    tile_size: u32,
+    resampling: Resampling,
+    area_average: bool,
+    lo: f64,
+    inv_span: f64,
+) -> Option<Vec<u8>> {
+    let n = tile_size as usize;
+    let mut rgba = vec![0u8; n * n * 4];
+    let mut hits = vec![0u8; n * n];
+
+    for band in 0..3 {
+        sample_grid(source, band, coord, tile_size, resampling, area_average, |j, i, v| {
+            let t = ((v - lo) * inv_span * 255.0).clamp(0.0, 255.0);
+            rgba[(i * n + j) * 4 + band] = t as u8;
+            hits[i * n + j] += 1;
+        });
+    }
+    // Opaque where all three colour bands resolved.
+    let mut any = false;
+    for (px, &h) in hits.iter().enumerate() {
+        if h == 3 {
+            rgba[px * 4 + 3] = 255;
+            any = true;
+        }
+    }
+    if !any {
+        return None;
+    }
+    if source.band_count() == 4 {
+        sample_grid(source, 3, coord, tile_size, resampling, area_average, |j, i, v| {
+            let px = i * n + j;
+            if hits[px] == 3 {
+                let a = ((v - lo) * inv_span * 255.0).clamp(0.0, 255.0);
+                rgba[px * 4 + 3] = a as u8;
+            }
+        });
+    }
+    Some(rgba)
+}
+
+/// Render one tile to an encoded PNG, or `None` when every pixel falls
+/// outside the source or on nodata.
+fn render_tile_png(
+    source: &RasterSource,
+    shader: &Shader,
+    coord: TileCoord,
+    tile_size: u32,
+    resampling: Resampling,
+) -> Result<Option<Vec<u8>>> {
+    let res = crate::mercator::resolution(coord.z, tile_size);
+    // At overview zooms one output pixel spans several source cells; point
+    // sampling would skip most of the data (or all of it, for a raster
+    // smaller than the pixel spacing). Switch to area averaging there.
+    let area_average = res > 2.0 * source.native_resolution_m();
+
+    let rgba = match shader {
+        Shader::Colormap(params) => {
+            let n = tile_size as usize;
+            let mut tile = Raster::filled(n, n, f64::NAN);
+            let mut any = false;
+            sample_grid(source, 0, coord, tile_size, resampling, area_average, |j, i, v| {
+                // Raster::set on a freshly allocated grid cannot fail in-bounds.
+                let _ = tile.set(i, j, v);
+                any = true;
+            });
+            if !any {
+                return Ok(None);
+            }
+            raster_to_rgba(&tile, params)
+        }
+        Shader::Rgb { lo, inv_span } => {
+            match render_tile_rgb(source, coord, tile_size, resampling, area_average, *lo, *inv_span)
+            {
+                Some(rgba) => rgba,
+                None => return Ok(None),
+            }
+        }
+    };
+    rgba_to_png_bytes(tile_size, tile_size, &rgba)
+        .map(Some)
+        .map_err(|e| Error::Encode(e.to_string()))
+}
+
+/// Resolve the effective zoom range and shader for a run.
+fn resolve(source: &RasterSource, opts: &PyramidOptions) -> Result<(u8, u8, Shader)> {
     let max_zoom = opts.max_zoom.unwrap_or_else(|| source.native_max_zoom(opts.tile_size));
     let min_zoom = opts.min_zoom.unwrap_or(0);
     if min_zoom > max_zoom {
@@ -127,16 +213,22 @@ fn resolve(
             "min zoom {min_zoom} exceeds max zoom {max_zoom}"
         )));
     }
-    let params = match opts.range {
-        Some((lo, hi)) if lo < hi => ColormapParams::with_range(opts.scheme, lo, hi),
-        Some((lo, hi)) => {
-            return Err(Error::InvalidInput(format!(
-                "invalid stretch range: {lo}..{hi}"
-            )));
-        }
-        None => auto_params(source.raster(), opts.scheme),
+    if let Some((lo, hi)) = opts.range
+        && lo >= hi
+    {
+        return Err(Error::InvalidInput(format!("invalid stretch range: {lo}..{hi}")));
+    }
+    let shader = if source.band_count() >= 3 {
+        // RGB(A): default stretch assumes byte imagery.
+        let (lo, hi) = opts.range.unwrap_or((0.0, 255.0));
+        Shader::Rgb { lo, inv_span: 1.0 / (hi - lo) }
+    } else {
+        Shader::Colormap(match opts.range {
+            Some((lo, hi)) => ColormapParams::with_range(opts.scheme, lo, hi),
+            None => auto_params(source.raster(), opts.scheme),
+        })
     };
-    Ok((min_zoom, max_zoom, params))
+    Ok((min_zoom, max_zoom, shader))
 }
 
 /// Total tiles that would be rendered for the source at the given options.
@@ -165,14 +257,14 @@ where
     S: TileSink + Send,
     F: Fn(u64) + Sync,
 {
-    let (min_zoom, max_zoom, params) = resolve(source, opts)?;
+    let (min_zoom, max_zoom, shader) = resolve(source, opts)?;
     let bounds = source.bounds_meters();
 
     let tiles: Vec<TileCoord> = (min_zoom..=max_zoom)
         .flat_map(|z| TileRange::for_bounds(bounds, z).iter())
         .collect();
 
-    let stats = run_tiles(source, opts, &params, &tiles, sink, &progress)?;
+    let stats = run_tiles(source, opts, &shader, &tiles, sink, &progress)?;
 
     sink.finalize(&PyramidMetadata {
         name: opts.name.clone(),
@@ -188,7 +280,7 @@ where
 fn run_tiles<S, F>(
     source: &RasterSource,
     opts: &PyramidOptions,
-    params: &ColormapParams,
+    shader: &Shader,
     tiles: &[TileCoord],
     sink: &mut S,
     progress: &F,
@@ -219,9 +311,9 @@ where
             .try_for_each_init(
                 || tx.clone(),
                 |tx, &coord| {
-                    if let Some(tile) = render_tile(source, coord, opts.tile_size, opts.resampling)
+                    if let Some(png) =
+                        render_tile_png(source, shader, coord, opts.tile_size, opts.resampling)?
                     {
-                        let png = encode_tile(&tile, params, opts.tile_size)?;
                         // The writer only hangs up on error; surfaced below.
                         let _ = tx.send((coord, png));
                     }
@@ -244,7 +336,7 @@ where
 fn run_tiles<S, F>(
     source: &RasterSource,
     opts: &PyramidOptions,
-    params: &ColormapParams,
+    shader: &Shader,
     tiles: &[TileCoord],
     sink: &mut S,
     progress: &F,
@@ -255,9 +347,8 @@ where
 {
     let mut stats = PyramidStats::default();
     for (i, &coord) in tiles.iter().enumerate() {
-        match render_tile(source, coord, opts.tile_size, opts.resampling) {
-            Some(tile) => {
-                let png = encode_tile(&tile, params, opts.tile_size)?;
+        match render_tile_png(source, shader, coord, opts.tile_size, opts.resampling)? {
+            Some(png) => {
                 sink.put(coord, &png)?;
                 stats.written += 1;
             }
@@ -346,6 +437,56 @@ mod tests {
         let mut sink = MemSink::new();
         let stats = generate(&src, &opts, &mut sink, |_| {}).unwrap();
         assert_eq!(counted, stats.written + stats.skipped);
+    }
+
+    #[test]
+    fn rgb_source_renders_color_tiles() {
+        // Constant-colour RGB bands: r=200, g=100, b=50.
+        let n = 64;
+        let mut bands = vec![];
+        for value in [200.0, 100.0, 50.0] {
+            let mut r = Raster::filled(n, n, value);
+            r.set_transform(GeoTransform::new(-5.0, 5.0, 10.0 / n as f64, -10.0 / n as f64));
+            r.set_crs(Some(CRS::from_epsg(4326)));
+            bands.push(r);
+        }
+        let src = RasterSource::new_multi(bands, None).unwrap();
+        assert_eq!(src.band_count(), 3);
+
+        let opts = PyramidOptions {
+            min_zoom: Some(2),
+            max_zoom: Some(4),
+            ..Default::default()
+        };
+        let mut sink = MemSink::new();
+        let stats = generate(&src, &opts, &mut sink, |_| {}).unwrap();
+        assert!(stats.written > 0);
+        for png in sink.tiles.values() {
+            assert_eq!(&png[..4], &[0x89, b'P', b'N', b'G']);
+        }
+    }
+
+    #[test]
+    fn rgba_alpha_band_controls_transparency() {
+        let n = 64;
+        let mut bands = vec![];
+        for value in [200.0, 100.0, 50.0, 0.0] {
+            let mut r = Raster::filled(n, n, value);
+            r.set_transform(GeoTransform::new(-5.0, 5.0, 10.0 / n as f64, -10.0 / n as f64));
+            r.set_crs(Some(CRS::from_epsg(4326)));
+            bands.push(r);
+        }
+        let src = RasterSource::new_multi(bands, None).unwrap();
+        // Alpha band of zeros must still produce (fully transparent) tiles,
+        // exercising the 4-band path end to end.
+        let opts = PyramidOptions {
+            min_zoom: Some(3),
+            max_zoom: Some(3),
+            ..Default::default()
+        };
+        let mut sink = MemSink::new();
+        let stats = generate(&src, &opts, &mut sink, |_| {}).unwrap();
+        assert!(stats.written > 0);
     }
 
     #[test]

@@ -28,35 +28,73 @@ pub enum Resampling {
     Bilinear,
 }
 
-/// A tileable raster: data plus the analytic projection to Web Mercator.
+/// A tileable raster: 1 (gray), 3 (RGB) or 4 (RGBA) co-registered bands
+/// plus the analytic projection to Web Mercator.
 #[derive(Debug)]
 pub struct RasterSource {
-    raster: Raster<f64>,
+    bands: Vec<Raster<f64>>,
     crs: SourceCrs,
 }
 
 impl RasterSource {
-    /// Wrap a raster, detecting its CRS.
+    /// Wrap a single-band raster, detecting its CRS.
     ///
     /// Detection order: explicit `crs_override`, then the raster's EPSG code
     /// (4326 → lon/lat, 3857/900913 → mercator), then a bounds heuristic
     /// (coordinates within ±180/±90 look like degrees). Anything else is
     /// rejected — reproject the input first.
     pub fn new(raster: Raster<f64>, crs_override: Option<SourceCrs>) -> Result<Self> {
-        if raster.rows() == 0 || raster.cols() == 0 {
+        Self::new_multi(vec![raster], crs_override)
+    }
+
+    /// Wrap 1, 3 or 4 co-registered bands (gray, RGB, RGBA).
+    ///
+    /// All bands must share shape and geotransform; CRS detection follows
+    /// the rules of [`RasterSource::new`] using the first band.
+    pub fn new_multi(bands: Vec<Raster<f64>>, crs_override: Option<SourceCrs>) -> Result<Self> {
+        if !matches!(bands.len(), 1 | 3 | 4) {
+            return Err(Error::InvalidInput(format!(
+                "expected 1, 3 or 4 bands, got {}",
+                bands.len()
+            )));
+        }
+        let first = &bands[0];
+        if first.rows() == 0 || first.cols() == 0 {
             return Err(Error::InvalidInput("empty raster".into()));
         }
-        if !raster.transform().is_north_up() {
+        if !first.transform().is_north_up() {
             return Err(Error::InvalidInput(
                 "rotated rasters are not supported; warp to north-up first".into(),
             ));
         }
+        for (i, b) in bands.iter().enumerate().skip(1) {
+            if b.shape() != first.shape() {
+                return Err(Error::InvalidInput(format!(
+                    "band {} shape {:?} differs from band 1 {:?}",
+                    i + 1,
+                    b.shape(),
+                    first.shape()
+                )));
+            }
+            let (a, c) = (b.transform().to_gdal(), first.transform().to_gdal());
+            if a.iter().zip(&c).any(|(x, y)| (x - y).abs() > 1e-9) {
+                return Err(Error::InvalidInput(format!(
+                    "band {} geotransform differs from band 1",
+                    i + 1
+                )));
+            }
+        }
 
         let crs = match crs_override {
             Some(crs) => crs,
-            None => Self::detect_crs(&raster)?,
+            None => Self::detect_crs(first)?,
         };
-        Ok(Self { raster, crs })
+        Ok(Self { bands, crs })
+    }
+
+    /// Number of bands (1, 3 or 4).
+    pub fn band_count(&self) -> usize {
+        self.bands.len()
     }
 
     fn detect_crs(raster: &Raster<f64>) -> Result<SourceCrs> {
@@ -94,14 +132,19 @@ impl RasterSource {
         self.crs
     }
 
-    /// Borrow the underlying raster.
+    /// Borrow the first band (the only band for single-band sources).
     pub fn raster(&self) -> &Raster<f64> {
-        &self.raster
+        &self.bands[0]
+    }
+
+    /// Borrow a band by 0-based index.
+    pub fn band(&self, b: usize) -> &Raster<f64> {
+        &self.bands[b]
     }
 
     /// Source bounds in Web Mercator meters `(min_x, min_y, max_x, max_y)`.
     pub fn bounds_meters(&self) -> (f64, f64, f64, f64) {
-        let (min_x, min_y, max_x, max_y) = self.raster.bounds();
+        let (min_x, min_y, max_x, max_y) = self.bands[0].bounds();
         match self.crs {
             SourceCrs::Mercator => (min_x, min_y, max_x, max_y),
             SourceCrs::LonLat => {
@@ -116,7 +159,7 @@ impl RasterSource {
 
     /// Source bounds in lon/lat degrees `(west, south, east, north)`.
     pub fn bounds_lonlat(&self) -> (f64, f64, f64, f64) {
-        let (min_x, min_y, max_x, max_y) = self.raster.bounds();
+        let (min_x, min_y, max_x, max_y) = self.bands[0].bounds();
         match self.crs {
             SourceCrs::LonLat => (min_x, min_y, max_x, max_y),
             SourceCrs::Mercator => {
@@ -132,7 +175,7 @@ impl RasterSource {
     /// For lon/lat sources this uses the equatorial conversion
     /// (deg × πR/180), matching gdal2tiles' zoom selection.
     pub fn native_resolution_m(&self) -> f64 {
-        let cell = self.raster.cell_size();
+        let cell = self.bands[0].cell_size();
         match self.crs {
             SourceCrs::Mercator => cell,
             SourceCrs::LonLat => cell * ORIGIN_SHIFT_M / 180.0,
@@ -144,20 +187,25 @@ impl RasterSource {
         mercator::zoom_for_resolution(self.native_resolution_m(), tile_size)
     }
 
-    /// Sample the source at a Web Mercator point. `None` means outside the
-    /// raster or nodata.
+    /// Sample the first band at a Web Mercator point. `None` means outside
+    /// the raster or nodata.
     pub fn sample(&self, mx: f64, my: f64, method: Resampling) -> Option<f64> {
+        self.sample_band(0, mx, my, method)
+    }
+
+    /// Sample one band (0-based) at a Web Mercator point.
+    pub fn sample_band(&self, band: usize, mx: f64, my: f64, method: Resampling) -> Option<f64> {
         let (sx, sy) = match self.crs {
             SourceCrs::Mercator => (mx, my),
             SourceCrs::LonLat => mercator::meters_to_lonlat(mx, my),
         };
-        let (col, row) = self.raster.geo_to_pixel(sx, sy);
+        let (col, row) = self.bands[band].geo_to_pixel(sx, sy);
         if !col.is_finite() || !row.is_finite() {
             return None;
         }
         match method {
-            Resampling::Nearest => self.sample_nearest(col, row),
-            Resampling::Bilinear => self.sample_bilinear(col, row),
+            Resampling::Nearest => self.sample_nearest(band, col, row),
+            Resampling::Bilinear => self.sample_bilinear(band, col, row),
         }
     }
 
@@ -169,6 +217,18 @@ impl RasterSource {
     /// Falls back to bilinear at the rectangle center when the footprint is
     /// smaller than one cell.
     pub fn sample_area(&self, mx0: f64, my0: f64, mx1: f64, my1: f64) -> Option<f64> {
+        self.sample_area_band(0, mx0, my0, mx1, my1)
+    }
+
+    /// Area-average one band (0-based) over a Web Mercator rectangle.
+    pub fn sample_area_band(
+        &self,
+        band: usize,
+        mx0: f64,
+        my0: f64,
+        mx1: f64,
+        my1: f64,
+    ) -> Option<f64> {
         let ((sx0, sy0), (sx1, sy1)) = match self.crs {
             SourceCrs::Mercator => ((mx0, my0), (mx1, my1)),
             SourceCrs::LonLat => (
@@ -176,8 +236,8 @@ impl RasterSource {
                 mercator::meters_to_lonlat(mx1, my1),
             ),
         };
-        let (ca, ra) = self.raster.geo_to_pixel(sx0.min(sx1), sy0.max(sy1));
-        let (cb, rb) = self.raster.geo_to_pixel(sx0.max(sx1), sy0.min(sy1));
+        let (ca, ra) = self.bands[band].geo_to_pixel(sx0.min(sx1), sy0.max(sy1));
+        let (cb, rb) = self.bands[band].geo_to_pixel(sx0.max(sx1), sy0.min(sy1));
         if !ca.is_finite() || !cb.is_finite() || !ra.is_finite() || !rb.is_finite() {
             return None;
         }
@@ -190,21 +250,27 @@ impl RasterSource {
 
         if col_start > col_end || row_start > row_end {
             // Footprint narrower than a cell: behave like point sampling.
-            return self.sample((mx0 + mx1) / 2.0, (my0 + my1) / 2.0, Resampling::Bilinear);
+            return self.sample_band(
+                band,
+                (mx0 + mx1) / 2.0,
+                (my0 + my1) / 2.0,
+                Resampling::Bilinear,
+            );
         }
 
         // Intersect with the raster so footprints that poke outside don't
         // iterate over (possibly millions of) nonexistent cells.
+        let raster = &self.bands[band];
         let col_start = col_start.max(0);
-        let col_end = col_end.min(self.raster.cols() as i64 - 1);
+        let col_end = col_end.min(raster.cols() as i64 - 1);
         let row_start = row_start.max(0);
-        let row_end = row_end.min(self.raster.rows() as i64 - 1);
+        let row_end = row_end.min(raster.rows() as i64 - 1);
 
         let mut acc = 0.0;
         let mut count = 0u64;
         for row in row_start..=row_end {
             for col in col_start..=col_end {
-                if let Some(v) = self.valid_at(row, col) {
+                if let Some(v) = self.valid_at(band, row, col) {
                     acc += v;
                     count += 1;
                 }
@@ -213,26 +279,26 @@ impl RasterSource {
         (count > 0).then(|| acc / count as f64)
     }
 
-    fn valid_at(&self, row: i64, col: i64) -> Option<f64> {
-        if row < 0 || col < 0 || row >= self.raster.rows() as i64 || col >= self.raster.cols() as i64
-        {
+    fn valid_at(&self, band: usize, row: i64, col: i64) -> Option<f64> {
+        let raster = &self.bands[band];
+        if row < 0 || col < 0 || row >= raster.rows() as i64 || col >= raster.cols() as i64 {
             return None;
         }
-        let v = self.raster.get(row as usize, col as usize).ok()?;
-        if v.is_nan() || self.raster.is_nodata(v) {
+        let v = raster.get(row as usize, col as usize).ok()?;
+        if v.is_nan() || raster.is_nodata(v) {
             None
         } else {
             Some(v)
         }
     }
 
-    fn sample_nearest(&self, col: f64, row: f64) -> Option<f64> {
-        self.valid_at(row.floor() as i64, col.floor() as i64)
+    fn sample_nearest(&self, band: usize, col: f64, row: f64) -> Option<f64> {
+        self.valid_at(band, row.floor() as i64, col.floor() as i64)
     }
 
     /// Bilinear interpolation between pixel centers, renormalizing weights
     /// over the valid neighbours so nodata does not bleed into the result.
-    fn sample_bilinear(&self, col: f64, row: f64) -> Option<f64> {
+    fn sample_bilinear(&self, band: usize, col: f64, row: f64) -> Option<f64> {
         // geo_to_pixel puts pixel centers at fractional +0.5.
         let u = col - 0.5;
         let v = row - 0.5;
@@ -255,7 +321,7 @@ impl RasterSource {
             if w <= 0.0 {
                 continue;
             }
-            if let Some(val) = self.valid_at(r, c) {
+            if let Some(val) = self.valid_at(band, r, c) {
                 acc += val * w;
                 wsum += w;
             }
