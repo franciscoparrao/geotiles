@@ -19,9 +19,9 @@ categories = ["science::geo", "command-line-utilities"]
 thiserror = "2"
 anyhow = "1"
 
-# Ecosystem reuse (SurtGIS)
-surtgis-core = { version = "0.15", path = "../surtgis/crates/core", default-features = false }
-surtgis-colormap = { version = "0.15", path = "../surtgis/crates/colormap" }
+# Ecosystem reuse (SurtGIS, published on crates.io)
+surtgis-core = { version = "0.15.4", default-features = false }
+surtgis-colormap = "0.15.4"
 
 # Storage
 rusqlite = { version = "0.33", features = ["bundled"] }

@@ -54,8 +54,10 @@ crates/
 ```
 
 Raster I/O (`Raster<f64>`, GeoTIFF) comes from
-[`surtgis-core`](../surtgis); colour mapping and PNG encoding from
-`surtgis-colormap`.
+[`surtgis-core`](https://crates.io/crates/surtgis-core); colour mapping and
+PNG encoding from
+[`surtgis-colormap`](https://crates.io/crates/surtgis-colormap). Both are
+pulled from crates.io, so the repo builds standalone.
 
 ## Known limitations (v0.1)
 
