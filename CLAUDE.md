@@ -64,8 +64,9 @@ Comparar salidas contra **tippecanoe**/gdal2tiles (visual + estructura MBTiles).
   write_cog_rgb produce byte RGB(A) interleaved con ExtraSamples=2.
 
 ## Próximos pasos al retomar
-1. Evaluar MVT para v0.2 (geozero + simplificación por zoom; comparar
-   contra tippecanoe).
+1. MVT v0.2: evaluación COMPLETA en `SPEC_MVT_V02.md` (recomendación: GO
+   acotado con crates `mvt` + `geo`; ~2 sesiones). Esperando GO del autor
+   y respuesta a las 3 decisiones de la sección 8 del spec.
 2. WebP como formato de tile alternativo.
 3. Considerar release 0.1.0 a crates.io (MVP + RGB(A) completos).
 4. Contribuir lectura multibanda upstream a surtgis-core (band es no-op).
