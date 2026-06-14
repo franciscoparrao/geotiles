@@ -101,15 +101,16 @@ struct RasterArgs {
 
 #[derive(clap::Args)]
 struct VectorArgs {
-    /// Input vector dataset (GeoJSON or GeoPackage) in EPSG:4326 or 3857.
-    input: PathBuf,
+    /// One or more input layers, each `[name=]path[#gpkg_table]`
+    /// (GeoJSON or GeoPackage, EPSG:4326 or 3857). Each input becomes a
+    /// layer in the tileset; the layer name defaults to the file stem.
+    /// Examples: `cuencas.geojson`, `red=hidro.gpkg#rios`.
+    #[arg(required = true, num_args = 1..)]
+    inputs: Vec<String>,
     /// Output: file.mbtiles or a directory for the z/x/y.pbf tree.
     #[arg(short, long)]
     output: PathBuf,
-    /// GeoPackage table to read (default: first layer).
-    #[arg(long)]
-    layer: Option<String>,
-    /// Layer/tileset name in the output (default: input stem).
+    /// Tileset name in the output metadata (default: first layer name).
     #[arg(long)]
     name: Option<String>,
     /// Lowest zoom level.
@@ -124,6 +125,37 @@ struct VectorArgs {
     /// Override CRS detection.
     #[arg(long, value_enum)]
     source_crs: Option<CrsArg>,
+}
+
+/// One parsed `[name=]path[#gpkg_table]` layer spec.
+struct LayerSpec {
+    name: String,
+    path: PathBuf,
+    gpkg_table: Option<String>,
+}
+
+/// Parse `[name=]path[#gpkg_table]`. The layer name defaults to the file
+/// stem; `#table` selects a GeoPackage table (lets one .gpkg supply
+/// several layers).
+fn parse_layer_spec(spec: &str) -> Result<LayerSpec> {
+    let (name_opt, rest) = match spec.split_once('=') {
+        Some((n, r)) => (Some(n.to_string()), r),
+        None => (None, spec),
+    };
+    let (path_str, gpkg_table) = match rest.split_once('#') {
+        Some((p, t)) => (p, Some(t.to_string())),
+        None => (rest, None),
+    };
+    if path_str.is_empty() {
+        anyhow::bail!("empty path in layer spec {spec:?}");
+    }
+    let path = PathBuf::from(path_str);
+    let name = name_opt.unwrap_or_else(|| {
+        path.file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "layer".into())
+    });
+    Ok(LayerSpec { name, path, gpkg_table })
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -258,19 +290,29 @@ fn cmd_raster(args: RasterArgs) -> Result<()> {
 }
 
 fn cmd_vector(args: VectorArgs) -> Result<()> {
-    let name = args.name.clone().unwrap_or_else(|| {
-        args.input
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "geotiles".into())
-    });
-    let source = VectorSource::from_file(
-        &args.input,
-        &name,
-        args.layer.as_deref(),
-        args.source_crs.map(Into::into),
+    let crs = args.source_crs.map(Into::into);
+    let specs: Vec<LayerSpec> = args
+        .inputs
+        .iter()
+        .map(|s| parse_layer_spec(s))
+        .collect::<Result<_>>()?;
+
+    // First spec seeds the source; the rest stack on as extra layers.
+    let (first, rest) = specs.split_first().expect("clap guarantees >= 1 input");
+    let mut source = VectorSource::from_file(
+        &first.path,
+        &first.name,
+        first.gpkg_table.as_deref(),
+        crs,
     )
-    .with_context(|| format!("reading {}", args.input.display()))?;
+    .with_context(|| format!("reading {}", first.path.display()))?;
+    for spec in rest {
+        source
+            .push_file(&spec.path, &spec.name, spec.gpkg_table.as_deref(), crs)
+            .with_context(|| format!("reading {}", spec.path.display()))?;
+    }
+
+    let name = args.name.clone().unwrap_or_else(|| first.name.clone());
 
     let is_mbtiles = args
         .output
@@ -287,7 +329,12 @@ fn cmd_vector(args: VectorArgs) -> Result<()> {
     };
 
     let n_features: usize = source.layers().iter().map(|l| l.features.len()).sum();
-    eprintln!("{n_features} features, zooms {}..{}", opts.min_zoom, opts.max_zoom);
+    eprintln!(
+        "{} layer(s), {n_features} features, zooms {}..{}",
+        source.layers().len(),
+        opts.min_zoom,
+        opts.max_zoom
+    );
 
     let stats = if is_mbtiles {
         let mut sink = MbtilesSink::create(&args.output)?;
@@ -382,5 +429,44 @@ fn main() -> Result<()> {
             )
         }
         Command::Info { input } => cmd_info(&input),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layer_spec_plain_path_uses_stem() {
+        let s = parse_layer_spec("data/cuencas.geojson").unwrap();
+        assert_eq!(s.name, "cuencas");
+        assert_eq!(s.path, PathBuf::from("data/cuencas.geojson"));
+        assert!(s.gpkg_table.is_none());
+    }
+
+    #[test]
+    fn layer_spec_with_name_and_table() {
+        let s = parse_layer_spec("red=hidro.gpkg#rios").unwrap();
+        assert_eq!(s.name, "red");
+        assert_eq!(s.path, PathBuf::from("hidro.gpkg"));
+        assert_eq!(s.gpkg_table.as_deref(), Some("rios"));
+    }
+
+    #[test]
+    fn layer_spec_table_without_name() {
+        let s = parse_layer_spec("hidro.gpkg#rios").unwrap();
+        assert_eq!(s.name, "hidro");
+        assert_eq!(s.gpkg_table.as_deref(), Some("rios"));
+    }
+
+    #[test]
+    fn layer_spec_empty_path_rejected() {
+        assert!(parse_layer_spec("red=").is_err());
+    }
+
+    #[test]
+    fn verify_cli() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
     }
 }

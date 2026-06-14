@@ -82,10 +82,17 @@ Comparar salidas contra **tippecanoe**/gdal2tiles (visual + estructura MBTiles).
 - Validación: 170 tiles aceptados por driver MVT de GDAL; feature-count por
   tile idéntico a ogr2ogr -f MVT (12/12 en z10); render MapLibre OK.
 
+## CLI multi-capa MVT (2026-06-13)
+- Subcomando `vector` toma N inputs, cada uno `[nombre=]ruta[#tabla_gpkg]`;
+  cada input es una capa MVT. Nombre por defecto = stem. `#tabla` permite
+  varias capas desde un mismo GPKG.
+- VectorSource.push_file (refactor read_file compartido) apila capas desde
+  archivo; rechaza nombres de capa duplicados (id MVT debe ser único).
+- Validado: 3 capas (cuencas/red/estaciones) separadas en metadata
+  vector_layers y dentro del tile; 170 tiles OK por GDAL.
+
 ## Próximos pasos al retomar
-1. CLI multi-capa para MVT (el modelo VectorSource ya es multi-capa;
-   falta exponer múltiples inputs/--layer en el subcomando vector).
-2. WebP como formato de tile alternativo.
-3. Considerar release 0.2.0 a crates.io (raster + RGB(A) + MVT completos).
-4. Contribuir upstream a surtgis-core: lectura multibanda (band no-op) y
+1. WebP como formato de tile alternativo.
+2. Considerar release 0.2.0 a crates.io (raster + RGB(A) + MVT completos).
+3. Contribuir upstream a surtgis-core: lectura multibanda (band no-op) y
    GeoJSON con geometrías de línea.

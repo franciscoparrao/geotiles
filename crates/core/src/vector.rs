@@ -53,17 +53,7 @@ impl VectorSource {
         gpkg_layer: Option<&str>,
         crs_override: Option<SourceCrs>,
     ) -> Result<Self> {
-        let path = path.as_ref();
-        let ext = path
-            .extension()
-            .map(|e| e.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
-        let fc = match ext.as_str() {
-            "gpkg" => surtgis_core::vector::read_gpkg(path, gpkg_layer)?,
-            // Own GeoJSON reader: surtgis' parser lacks line geometries.
-            "geojson" | "json" => read_geojson(path)?,
-            _ => surtgis_core::vector::read_vector(path)?,
-        };
+        let fc = read_file(path.as_ref(), gpkg_layer)?;
         Self::from_collection(layer_name, fc, crs_override)
     }
 
@@ -91,6 +81,26 @@ impl VectorSource {
         Ok(())
     }
 
+    /// Read a file and add it as another named layer.
+    ///
+    /// Rejects a layer name already present so a tileset never has two
+    /// layers with the same `id` (which would be invalid MVT metadata).
+    pub fn push_file(
+        &mut self,
+        path: impl AsRef<Path>,
+        layer_name: &str,
+        gpkg_layer: Option<&str>,
+        crs_override: Option<SourceCrs>,
+    ) -> Result<()> {
+        if self.layers.iter().any(|l| l.name == layer_name) {
+            return Err(Error::InvalidInput(format!(
+                "duplicate layer name {layer_name:?}"
+            )));
+        }
+        let fc = read_file(path.as_ref(), gpkg_layer)?;
+        self.push_layer(layer_name, fc, crs_override)
+    }
+
     /// The layers, in encoding order.
     pub fn layers(&self) -> &[VectorLayer] {
         &self.layers
@@ -114,6 +124,21 @@ impl VectorSource {
         let (w, s) = mercator::meters_to_lonlat(x0, y0);
         let (e, n) = mercator::meters_to_lonlat(x1, y1);
         (w, s, e, n)
+    }
+}
+
+/// Read any supported vector file into a `FeatureCollection`, dispatching
+/// by extension. `gpkg_layer` selects a GeoPackage table (default: first).
+fn read_file(path: &Path, gpkg_layer: Option<&str>) -> Result<FeatureCollection> {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "gpkg" => Ok(surtgis_core::vector::read_gpkg(path, gpkg_layer)?),
+        // Own GeoJSON reader: surtgis' parser lacks line geometries.
+        "geojson" | "json" => read_geojson(path),
+        _ => Ok(surtgis_core::vector::read_vector(path)?),
     }
 }
 
@@ -322,6 +347,27 @@ mod tests {
         src.push_layer("b", collection(), None).unwrap();
         assert_eq!(src.layers().len(), 2);
         assert_eq!(src.layers()[1].name, "b");
+    }
+
+    #[test]
+    fn push_file_reads_and_rejects_duplicate_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pts.geojson");
+        std::fs::write(
+            &path,
+            r#"{"type":"FeatureCollection","features":[
+                {"type":"Feature","properties":{"k":1},
+                 "geometry":{"type":"Point","coordinates":[-71.0,-33.0]}}]}"#,
+        )
+        .unwrap();
+
+        let mut src = VectorSource::from_collection("base", collection(), None).unwrap();
+        src.push_file(&path, "puntos", None, None).unwrap();
+        assert_eq!(src.layers().len(), 2);
+        assert_eq!(src.layers()[1].name, "puntos");
+
+        // Same name twice → rejected.
+        assert!(src.push_file(&path, "puntos", None, None).is_err());
     }
 
     #[test]

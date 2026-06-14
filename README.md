@@ -43,7 +43,10 @@ geotiles cog ortho.tif -o ortho_cog.tif --bands 1,2,3
 
 # Vector tiles (MVT) from GeoJSON or GeoPackage
 geotiles vector cuencas.geojson -o cuencas.mbtiles --max-zoom 14
-geotiles vector hidro.gpkg -o tiles/ --layer rios --simplify 1.5
+
+# Multi-layer tileset: each input is a layer ([name=]path[#gpkg_table])
+geotiles vector cuencas.geojson red=hidro.gpkg#rios estaciones.geojson \
+  -o hidrografia.mbtiles --name hidrografia
 ```
 
 Inputs must be in EPSG:4326 or EPSG:3857 (`--source-crs` overrides
@@ -85,10 +88,10 @@ pulled from crates.io, so the repo builds standalone.
   non-linear stretches are out of scope).
 - Readers decode the full dataset into memory (same approach as
   surtgis-core's native readers); streaming reads are future work.
-- **Vector tiles**: one layer per tileset (the model is multi-layer, only
-  the CLI is single-layer for now); no tippecanoe-style feature dropping
-  for planet-scale data — geotiles targets thematic layers (thousands to
-  hundreds of thousands of features).
+- **Vector tiles**: no tippecanoe-style feature dropping for planet-scale
+  data — geotiles targets thematic layers (thousands to hundreds of
+  thousands of features). One GeoPackage table per layer spec (use several
+  `path#table` specs to pull multiple tables from one .gpkg).
 
 ## Validation
 
