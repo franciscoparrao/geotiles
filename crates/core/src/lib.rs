@@ -30,8 +30,10 @@ pub mod error;
 pub mod io;
 pub mod mbtiles;
 pub mod mercator;
+pub mod mvt;
 pub mod pyramid;
 pub mod source;
+pub mod vector;
 pub mod xyz;
 
 pub use cog::{CogCompression, CogInfo, CogOptions, write_cog, write_cog_rgb};
@@ -39,10 +41,12 @@ pub use error::{Error, Result};
 pub use io::{band_count, read_bands};
 pub use mbtiles::MbtilesSink;
 pub use mercator::{TileCoord, TileRange};
+pub use mvt::{MvtOptions, generate_mvt};
 pub use pyramid::{
     PyramidMetadata, PyramidOptions, PyramidStats, TileSink, count_tiles, generate,
 };
 pub use source::{RasterSource, Resampling, SourceCrs};
+pub use vector::{VectorFeature, VectorLayer, VectorSource};
 pub use xyz::XyzSink;
 
 // Re-export the colour schemes so CLI/users don't need surtgis-colormap directly.

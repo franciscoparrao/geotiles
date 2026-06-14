@@ -11,14 +11,21 @@ use crate::pyramid::{PyramidMetadata, TileSink};
 #[derive(Debug)]
 pub struct XyzSink {
     root: PathBuf,
+    ext: &'static str,
 }
 
 impl XyzSink {
-    /// Create the sink, ensuring `root` exists.
+    /// Create a PNG tile sink, ensuring `root` exists.
     pub fn create(root: impl AsRef<Path>) -> Result<Self> {
+        Self::with_extension(root, "png")
+    }
+
+    /// Create a sink writing tiles with the given file extension
+    /// (e.g. `"pbf"` for vector tiles).
+    pub fn with_extension(root: impl AsRef<Path>, ext: &'static str) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root).map_err(|source| Error::Io { path: root.clone(), source })?;
-        Ok(Self { root })
+        Ok(Self { root, ext })
     }
 
     /// Root directory of the tile tree.
@@ -31,12 +38,18 @@ impl TileSink for XyzSink {
     fn put(&mut self, coord: TileCoord, png: &[u8]) -> Result<()> {
         let dir = self.root.join(coord.z.to_string()).join(coord.x.to_string());
         fs::create_dir_all(&dir).map_err(|source| Error::Io { path: dir.clone(), source })?;
-        let path = dir.join(format!("{}.png", coord.y));
+        let path = dir.join(format!("{}.{}", coord.y, self.ext));
         fs::write(&path, png).map_err(|source| Error::Io { path, source })
     }
 
     fn finalize(&mut self, meta: &PyramidMetadata) -> Result<()> {
         let (w, s, e, n) = meta.bounds_lonlat;
+        // For vector tilesets, embed the MBTiles-style `json` field so a
+        // viewer can discover the source-layer name; raster omits it.
+        let json_field = match &meta.json {
+            Some(j) => format!(",\n  \"json\": {j:?}"),
+            None => String::new(),
+        };
         // Minimal TileJSON-style summary so viewers can self-configure.
         let json = format!(
             concat!(
@@ -46,7 +59,7 @@ impl TileSink for XyzSink {
                 "  \"minzoom\": {minz},\n",
                 "  \"maxzoom\": {maxz},\n",
                 "  \"bounds\": [{w}, {s}, {e}, {n}],\n",
-                "  \"scheme\": \"xyz\"\n",
+                "  \"scheme\": \"xyz\"{json_field}\n",
                 "}}\n"
             ),
             name = meta.name,
@@ -57,6 +70,7 @@ impl TileSink for XyzSink {
             s = s,
             e = e,
             n = n,
+            json_field = json_field,
         );
         let path = self.root.join("metadata.json");
         fs::write(&path, json).map_err(|source| Error::Io { path, source })
@@ -78,6 +92,7 @@ mod tests {
             min_zoom: 0,
             max_zoom: 3,
             format: "png",
+            json: None,
         })
         .unwrap();
 

@@ -36,35 +36,59 @@
       .then(r => r.ok ? r.json() : Promise.reject(r.status))
       .then(meta => {
         const [w, s, e, n] = meta.bounds;
+        const isVector = meta.format === 'pbf';
         document.getElementById('info').textContent =
-          `${meta.name} — z${meta.minzoom}–${meta.maxzoom}`;
+          `${meta.name} — z${meta.minzoom}–${meta.maxzoom} (${meta.format})`;
+
+        const sources = {
+          osm: {
+            type: 'raster',
+            tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+            tileSize: 256,
+            attribution: '© OpenStreetMap'
+          }
+        };
+        const layers = [{ id: 'osm', type: 'raster', source: 'osm' }];
+
+        if (isVector) {
+          // Vector tileset: one source, fill/line/circle layers so all
+          // geometry kinds show. Source layer name comes from metadata json.
+          const meta_json = meta.json ? JSON.parse(meta.json) : {};
+          const srcLayer = (meta_json.vector_layers || [{}])[0].id || meta.name;
+          sources.geotiles = {
+            type: 'vector',
+            tiles: [`${tilesRoot}/{z}/{x}/{y}.pbf`],
+            minzoom: meta.minzoom,
+            maxzoom: meta.maxzoom,
+            bounds: meta.bounds
+          };
+          layers.push(
+            { id: 'gt-fill', type: 'fill', source: 'geotiles', 'source-layer': srcLayer,
+              filter: ['==', ['geometry-type'], 'Polygon'],
+              paint: { 'fill-color': '#3b82f6', 'fill-opacity': 0.4, 'fill-outline-color': '#1e40af' } },
+            { id: 'gt-line', type: 'line', source: 'geotiles', 'source-layer': srcLayer,
+              filter: ['==', ['geometry-type'], 'LineString'],
+              paint: { 'line-color': '#0e7490', 'line-width': 1.5 } },
+            { id: 'gt-point', type: 'circle', source: 'geotiles', 'source-layer': srcLayer,
+              filter: ['==', ['geometry-type'], 'Point'],
+              paint: { 'circle-radius': 4, 'circle-color': '#dc2626', 'circle-stroke-color': '#fff', 'circle-stroke-width': 1 } }
+          );
+        } else {
+          sources.geotiles = {
+            type: 'raster',
+            tiles: [`${tilesRoot}/{z}/{x}/{y}.png`],
+            tileSize: 256,
+            minzoom: meta.minzoom,
+            maxzoom: meta.maxzoom,
+            bounds: meta.bounds
+          };
+          layers.push({ id: 'geotiles', type: 'raster', source: 'geotiles',
+            paint: { 'raster-opacity': 0.85 } });
+        }
 
         const map = new maplibregl.Map({
           container: 'map',
-          style: {
-            version: 8,
-            sources: {
-              osm: {
-                type: 'raster',
-                tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
-                tileSize: 256,
-                attribution: '© OpenStreetMap'
-              },
-              geotiles: {
-                type: 'raster',
-                tiles: [`${tilesRoot}/{z}/{x}/{y}.png`],
-                tileSize: 256,
-                minzoom: meta.minzoom,
-                maxzoom: meta.maxzoom,
-                bounds: meta.bounds
-              }
-            },
-            layers: [
-              { id: 'osm', type: 'raster', source: 'osm' },
-              { id: 'geotiles', type: 'raster', source: 'geotiles',
-                paint: { 'raster-opacity': 0.85 } }
-            ]
-          },
+          style: { version: 8, sources, layers },
           bounds: [[w, s], [e, n]],
           fitBoundsOptions: { padding: 40 }
         });

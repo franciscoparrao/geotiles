@@ -7,8 +7,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use geotiles_core::{
-    CogCompression, CogOptions, ColorScheme, MbtilesSink, PyramidOptions, RasterSource,
-    Resampling, SourceCrs, XyzSink, count_tiles, generate, write_cog, write_cog_rgb,
+    CogCompression, CogOptions, ColorScheme, MbtilesSink, MvtOptions, PyramidOptions,
+    RasterSource, Resampling, SourceCrs, VectorSource, XyzSink, count_tiles, generate,
+    generate_mvt, write_cog, write_cog_rgb,
 };
 
 #[derive(Parser)]
@@ -25,6 +26,11 @@ enum Command {
     /// The output kind is inferred from -o: a path ending in .mbtiles
     /// produces an MBTiles file, anything else an XYZ directory.
     Raster(RasterArgs),
+    /// Tile a vector dataset (GeoJSON, GPKG) into MVT tiles.
+    ///
+    /// Output kind follows -o like `raster`: .mbtiles file or XYZ
+    /// directory of .pbf tiles (uncompressed, static-server friendly).
+    Vector(VectorArgs),
     /// Rewrite a raster as a Cloud Optimized GeoTIFF (Float32 + overviews).
     Cog {
         /// Input raster (GeoTIFF) in EPSG:4326 or EPSG:3857.
@@ -91,6 +97,33 @@ struct RasterArgs {
     /// bands rendered as RGB(A), e.g. --bands 4,3,2.
     #[arg(long, default_value = "1", value_delimiter = ',')]
     bands: Vec<usize>,
+}
+
+#[derive(clap::Args)]
+struct VectorArgs {
+    /// Input vector dataset (GeoJSON or GeoPackage) in EPSG:4326 or 3857.
+    input: PathBuf,
+    /// Output: file.mbtiles or a directory for the z/x/y.pbf tree.
+    #[arg(short, long)]
+    output: PathBuf,
+    /// GeoPackage table to read (default: first layer).
+    #[arg(long)]
+    layer: Option<String>,
+    /// Layer/tileset name in the output (default: input stem).
+    #[arg(long)]
+    name: Option<String>,
+    /// Lowest zoom level.
+    #[arg(long, default_value_t = 0)]
+    min_zoom: u8,
+    /// Highest zoom level.
+    #[arg(long, default_value_t = 14)]
+    max_zoom: u8,
+    /// Simplification tolerance in tile units (0 disables).
+    #[arg(long, default_value_t = 1.0)]
+    simplify: f64,
+    /// Override CRS detection.
+    #[arg(long, value_enum)]
+    source_crs: Option<CrsArg>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -224,6 +257,55 @@ fn cmd_raster(args: RasterArgs) -> Result<()> {
     Ok(())
 }
 
+fn cmd_vector(args: VectorArgs) -> Result<()> {
+    let name = args.name.clone().unwrap_or_else(|| {
+        args.input
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "geotiles".into())
+    });
+    let source = VectorSource::from_file(
+        &args.input,
+        &name,
+        args.layer.as_deref(),
+        args.source_crs.map(Into::into),
+    )
+    .with_context(|| format!("reading {}", args.input.display()))?;
+
+    let is_mbtiles = args
+        .output
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("mbtiles"));
+    let opts = MvtOptions {
+        min_zoom: args.min_zoom,
+        max_zoom: args.max_zoom,
+        simplify: args.simplify,
+        // Raw protobuf in XYZ trees so plain static servers work.
+        compress: is_mbtiles,
+        name,
+        ..Default::default()
+    };
+
+    let n_features: usize = source.layers().iter().map(|l| l.features.len()).sum();
+    eprintln!("{n_features} features, zooms {}..{}", opts.min_zoom, opts.max_zoom);
+
+    let stats = if is_mbtiles {
+        let mut sink = MbtilesSink::create(&args.output)?;
+        generate_mvt(&source, &opts, &mut sink, |_| {})?
+    } else {
+        let mut sink = XyzSink::with_extension(&args.output, "pbf")?;
+        generate_mvt(&source, &opts, &mut sink, |_| {})?
+    };
+
+    println!(
+        "MVT: {} tiles written, {} empty tiles skipped → {}",
+        stats.written,
+        stats.skipped,
+        args.output.display()
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_cog(
     input: &Path,
@@ -287,6 +369,7 @@ fn cmd_info(input: &Path) -> Result<()> {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Raster(args) => cmd_raster(args),
+        Command::Vector(args) => cmd_vector(args),
         Command::Cog { input, output, tile_size, no_compression, source_crs, bands, range } => {
             cmd_cog(
                 &input,

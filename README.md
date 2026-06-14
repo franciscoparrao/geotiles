@@ -16,7 +16,8 @@ v0.1 (raster pipeline). Vector tiles (MVT) and COG writing are planned.
 - [x] COG writing (Float32, deflate, 2× overviews; passes GDAL's COG validator)
 - [x] RGB(A) sources: multiband GeoTIFF reader, true-colour tiles
   (`--bands 1,2,3[,4]`) and byte RGB(A) COG output
-- [ ] Vector tiles (MVT) from GeoJSON/GPKG
+- [x] Vector tiles (MVT) from GeoJSON/GPKG — clip, per-zoom simplification,
+  MBTiles (`pbf`+gzip) or XYZ `.pbf` tree; matches GDAL's MVT output
 
 ## Usage
 
@@ -39,6 +40,10 @@ geotiles cog dem.tif -o dem_cog.tif
 # RGB imagery: true-colour tiles and byte RGB COG
 geotiles raster ortho.tif -o ortho.mbtiles --bands 1,2,3
 geotiles cog ortho.tif -o ortho_cog.tif --bands 1,2,3
+
+# Vector tiles (MVT) from GeoJSON or GeoPackage
+geotiles vector cuencas.geojson -o cuencas.mbtiles --max-zoom 14
+geotiles vector hidro.gpkg -o tiles/ --layer rios --simplify 1.5
 ```
 
 Inputs must be in EPSG:4326 or EPSG:3857 (`--source-crs` overrides
@@ -61,7 +66,9 @@ crates/
 │   ├── xyz.rs        z/x/y.png directory sink
 │   ├── mbtiles.rs    MBTiles 1.3 sink (rusqlite, bundled)
 │   ├── cog.rs        Cloud Optimized GeoTIFF writer (own TIFF encoder)
-│   └── io.rs         multiband GeoTIFF reader (tiff crate + geo tags)
+│   ├── io.rs         multiband GeoTIFF reader (tiff crate + geo tags)
+│   ├── vector.rs     VectorSource: GeoJSON/GPKG load, reprojection, layers
+│   └── mvt.rs        MVT pyramid: clip, simplify, quantize, encode, gzip
 └── cli/    geotiles binary (clap)
 ```
 
@@ -71,13 +78,17 @@ PNG encoding from
 [`surtgis-colormap`](https://crates.io/crates/surtgis-colormap). Both are
 pulled from crates.io, so the repo builds standalone.
 
-## Known limitations (v0.1)
+## Known limitations
 
 - No reprojection engine: only EPSG:4326 / EPSG:3857 inputs.
 - RGB stretch is one global `--range` for all bands (per-band ranges and
-  non-linear stretches are out of scope for v0.1).
-- The multiband reader decodes the full image into memory (same approach
-  as surtgis-core's native reader); streaming reads are a v0.2 topic.
+  non-linear stretches are out of scope).
+- Readers decode the full dataset into memory (same approach as
+  surtgis-core's native readers); streaming reads are future work.
+- **Vector tiles**: one layer per tileset (the model is multi-layer, only
+  the CLI is single-layer for now); no tippecanoe-style feature dropping
+  for planet-scale data — geotiles targets thematic layers (thousands to
+  hundreds of thousands of features).
 
 ## Validation
 

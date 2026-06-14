@@ -20,6 +20,11 @@ surtgis-colormap.workspace = true
 rusqlite.workspace = true
 flate2.workspace = true
 tiff.workspace = true
+mvt.workspace = true
+geo.workspace = true
+geo-types.workspace = true
+geojson.workspace = true
+serde_json.workspace = true
 rayon = { workspace = true, optional = true }
 
 [dev-dependencies]

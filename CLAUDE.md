@@ -1,6 +1,6 @@
 # geotiles — Teselado y map tiles geoespaciales (Rust, "tippecanoe lite")
 
-> **Estado:** v0.1 en desarrollo — pipeline raster funcionando (XYZ + MBTiles). Creado 2026-06-10.
+> **Estado:** v0.2 — raster (XYZ/MBTiles/COG/RGB) + vector tiles MVT. Creado 2026-06-10.
 > Familia de motores Rust del autor: SurtGIS, Hydroflux, Smelt, Anvil, Cantus, Criterium.
 > Doc madre: `~/proyectos/ideas-motores-rust.md` (idea L1 — habilitador, menos "paper").
 
@@ -19,7 +19,10 @@ tus webs SvelteKit.
       pasa el validador oficial de GDAL). Complementa el lector COG de SurtGIS.
 - [x] Empaquetado MBTiles (SQLite, rusqlite bundled).
 - [x] Promedio de área en zooms overview (sin tiles vacíos en zooms bajos).
-- [ ] (v0.2) Vector tiles MVT desde GeoJSON/GPKG; simplificación por zoom.
+- [x] RGB(A): lector multibanda, tiles true-color, COG byte.
+
+## v0.2 — COMPLETO
+- [x] Vector tiles MVT desde GeoJSON/GPKG; clip + simplificación por zoom.
 - [ ] WebP como formato alternativo de tile.
 
 ## Arquitectura tentativa
@@ -63,10 +66,26 @@ Comparar salidas contra **tippecanoe**/gdal2tiles (visual + estructura MBTiles).
 - cog.rs: write_pyramid compartido parametrizado por SampleSpec;
   write_cog_rgb produce byte RGB(A) interleaved con ExtraSamples=2.
 
+## Notas de implementación MVT (2026-06-13)
+- vector.rs: VectorSource multi-capa (CLI llena una; push_layer lista para
+  multi). Lector GeoJSON propio sobre crate `geojson` (el de surtgis-core
+  no soporta LineString); GPKG vía surtgis read_gpkg. Reproyección 4326→3857.
+- mvt.rs: por tile clip (geo BooleanOps) → simplify DP por zoom → cuantizar
+  a extent 4096 → encode (crate `mvt`) → gzip. Paralelo rayon+writer.
+- **Bug clave resuelto**: el encoder `mvt` 0.13 NO resetea su punto previo
+  en complete_geom; partes consecutivas que comparten endpoint cuantizado se
+  mis-codifican (LineTo sin MoveTo) → GDAL rechaza el tile. Fix:
+  avoid_shared_endpoints (revierte líneas, rota anillos) + idioma canónico
+  (complete_geom entre partes, encode cierra la última).
+- Versiones: geo 0.29 y rusqlite 0.39 alineadas con surtgis-core (conflicto
+  de i_overlay/i_float y libsqlite3-sys si difieren los major).
+- Validación: 170 tiles aceptados por driver MVT de GDAL; feature-count por
+  tile idéntico a ogr2ogr -f MVT (12/12 en z10); render MapLibre OK.
+
 ## Próximos pasos al retomar
-1. MVT v0.2: evaluación COMPLETA en `SPEC_MVT_V02.md` (recomendación: GO
-   acotado con crates `mvt` + `geo`; ~2 sesiones). Esperando GO del autor
-   y respuesta a las 3 decisiones de la sección 8 del spec.
+1. CLI multi-capa para MVT (el modelo VectorSource ya es multi-capa;
+   falta exponer múltiples inputs/--layer en el subcomando vector).
 2. WebP como formato de tile alternativo.
-3. Considerar release 0.1.0 a crates.io (MVP + RGB(A) completos).
-4. Contribuir lectura multibanda upstream a surtgis-core (band es no-op).
+3. Considerar release 0.2.0 a crates.io (raster + RGB(A) + MVT completos).
+4. Contribuir upstream a surtgis-core: lectura multibanda (band no-op) y
+   GeoJSON con geometrías de línea.

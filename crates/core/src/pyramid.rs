@@ -49,8 +49,10 @@ pub struct PyramidMetadata {
     pub bounds_lonlat: (f64, f64, f64, f64),
     pub min_zoom: u8,
     pub max_zoom: u8,
-    /// Tile image format ("png").
+    /// Tile format ("png" for raster, "pbf" for vector).
     pub format: &'static str,
+    /// MBTiles `json` metadata row (`vector_layers`); `None` for raster.
+    pub json: Option<String>,
 }
 
 /// Counters returned by [`generate`].
@@ -272,6 +274,7 @@ where
         min_zoom,
         max_zoom,
         format: "png",
+        json: None,
     })?;
     Ok(stats)
 }
