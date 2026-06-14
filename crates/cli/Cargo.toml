@@ -5,9 +5,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "CLI for generating XYZ tile pyramids and MBTiles from geospatial rasters"
+description = "CLI for generating raster tiles (XYZ/MBTiles), COG, and MVT vector tiles from geospatial data"
 keywords.workspace = true
 categories.workspace = true
+readme = "README.md"
 
 [[bin]]
 name = "geotiles"
@@ -17,6 +18,6 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 indicatif.workspace = true
-geotiles-core = { version = "0.1", path = "../core" }
+geotiles-core = { version = "0.2", path = "../core" }
 surtgis-core.workspace = true
 surtgis-colormap.workspace = true

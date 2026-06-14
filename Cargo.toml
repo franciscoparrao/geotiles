@@ -6,13 +6,13 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Francisco Parra"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/franciscoparrao/geotiles"
-description = "Web map tile generation in Rust: XYZ pyramids and MBTiles from geospatial rasters"
-keywords = ["gis", "geospatial", "tiles", "mbtiles", "raster"]
+description = "Web map tile generation in Rust: raster XYZ/MBTiles, COG, and MVT vector tiles"
+keywords = ["gis", "geospatial", "tiles", "mbtiles", "mvt"]
 categories = ["science::geo", "command-line-utilities"]
 
 [workspace.dependencies]

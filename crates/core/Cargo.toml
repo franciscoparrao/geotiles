@@ -5,9 +5,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Tile pyramid math, rendering and MBTiles packaging for geotiles"
+description = "Tile pyramid math, rendering, COG/MBTiles packaging and MVT encoding for geotiles"
 keywords.workspace = true
 categories = ["science::geo"]
+readme = "README.md"
 
 [features]
 default = ["parallel"]
