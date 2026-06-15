@@ -23,7 +23,9 @@ tus webs SvelteKit.
 
 ## v0.2 — COMPLETO
 - [x] Vector tiles MVT desde GeoJSON/GPKG; clip + simplificación por zoom.
-- [ ] WebP como formato alternativo de tile.
+- [x] WebP lossless como formato de tile (--format webp): ~20% más chico
+      que PNG, pixel-idéntico, puro Rust (image/image-webp, sin libwebp).
+- [x] Ejemplo SvelteKit (examples/sveltekit): sirve MBTiles vía endpoint.
 
 ## Arquitectura tentativa
 - `geotiles-core`: pirámides, codecs de tile, MVT encoder.

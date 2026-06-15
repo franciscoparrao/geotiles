@@ -36,6 +36,8 @@ geo-types = "0.7"
 rusqlite = { version = "0.39", features = ["bundled"] }
 flate2 = "1"
 tiff = { version = "0.10", features = ["deflate"] }
+# Pure-Rust lossless WebP tile encoding (no libwebp/C dependency).
+image = { version = "0.25", default-features = false, features = ["webp"] }
 
 # Parallelism
 rayon = "1.10"

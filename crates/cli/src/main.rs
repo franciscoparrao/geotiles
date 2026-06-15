@@ -8,7 +8,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use geotiles_core::{
     CogCompression, CogOptions, ColorScheme, MbtilesSink, MvtOptions, PyramidOptions,
-    RasterSource, Resampling, SourceCrs, VectorSource, XyzSink, count_tiles, generate,
+    RasterSource, Resampling, SourceCrs, TileFormat, VectorSource, XyzSink, count_tiles, generate,
     generate_mvt, write_cog, write_cog_rgb,
 };
 
@@ -84,6 +84,9 @@ struct RasterArgs {
     /// Resampling method.
     #[arg(long, value_enum, default_value_t = ResampleArg::Bilinear)]
     resample: ResampleArg,
+    /// Tile image format.
+    #[arg(long, value_enum, default_value_t = FormatArg::Png)]
+    format: FormatArg,
     /// Fixed stretch as MIN,MAX (default: data min/max).
     #[arg(long, value_parser = parse_range)]
     range: Option<(f64, f64)>,
@@ -174,6 +177,23 @@ impl From<ResampleArg> for Resampling {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
+enum FormatArg {
+    /// PNG (lossless, universal).
+    Png,
+    /// Lossless WebP — smaller than PNG, no quality loss.
+    Webp,
+}
+
+impl From<FormatArg> for TileFormat {
+    fn from(v: FormatArg) -> Self {
+        match v {
+            FormatArg::Png => TileFormat::Png,
+            FormatArg::Webp => TileFormat::WebP,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
 enum CrsArg {
     /// EPSG:4326 lon/lat degrees.
     #[value(name = "4326", alias = "lonlat", alias = "wgs84")]
@@ -252,6 +272,7 @@ fn cmd_raster(args: RasterArgs) -> Result<()> {
         resampling: args.resample.into(),
         scheme: parse_scheme(&args.scheme)?,
         range: args.range,
+        format: args.format.into(),
         name,
         ..Default::default()
     };
@@ -274,7 +295,7 @@ fn cmd_raster(args: RasterArgs) -> Result<()> {
         let mut sink = MbtilesSink::create(&args.output)?;
         generate(&source, &opts, &mut sink, |done| pb.set_position(done))?
     } else {
-        let mut sink = XyzSink::create(&args.output)?;
+        let mut sink = XyzSink::with_extension(&args.output, opts.format.as_str())?;
         generate(&source, &opts, &mut sink, |done| pb.set_position(done))?
     };
     pb.finish_and_clear();

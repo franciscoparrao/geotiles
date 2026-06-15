@@ -23,8 +23,31 @@ pub struct PyramidOptions {
     pub scheme: ColorScheme,
     /// Fixed (min, max) stretch; default: computed from the source data.
     pub range: Option<(f64, f64)>,
+    /// Encoded tile image format (default PNG).
+    pub format: TileFormat,
     /// Layer name recorded in the output metadata.
     pub name: String,
+}
+
+/// Encoded image format for raster tiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TileFormat {
+    /// PNG (lossless, universal). Default.
+    #[default]
+    Png,
+    /// Lossless WebP (pure-Rust VP8L) — typically smaller than PNG with no
+    /// quality loss.
+    WebP,
+}
+
+impl TileFormat {
+    /// The MBTiles/TileJSON `format` string and XYZ file extension.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TileFormat::Png => "png",
+            TileFormat::WebP => "webp",
+        }
+    }
 }
 
 impl Default for PyramidOptions {
@@ -36,6 +59,7 @@ impl Default for PyramidOptions {
             resampling: Resampling::default(),
             scheme: ColorScheme::Grayscale,
             range: None,
+            format: TileFormat::Png,
             name: "geotiles".into(),
         }
     }
@@ -163,14 +187,15 @@ fn render_tile_rgb(
     Some(rgba)
 }
 
-/// Render one tile to an encoded PNG, or `None` when every pixel falls
+/// Render one tile to an encoded image, or `None` when every pixel falls
 /// outside the source or on nodata.
-fn render_tile_png(
+fn render_tile_image(
     source: &RasterSource,
     shader: &Shader,
     coord: TileCoord,
     tile_size: u32,
     resampling: Resampling,
+    format: TileFormat,
 ) -> Result<Option<Vec<u8>>> {
     let res = crate::mercator::resolution(coord.z, tile_size);
     // At overview zooms one output pixel spans several source cells; point
@@ -201,9 +226,24 @@ fn render_tile_png(
             }
         }
     };
-    rgba_to_png_bytes(tile_size, tile_size, &rgba)
-        .map(Some)
-        .map_err(|e| Error::Encode(e.to_string()))
+    encode_rgba(&rgba, tile_size, format).map(Some)
+}
+
+/// Encode an RGBA tile buffer to the requested image format.
+fn encode_rgba(rgba: &[u8], tile_size: u32, format: TileFormat) -> Result<Vec<u8>> {
+    match format {
+        TileFormat::Png => rgba_to_png_bytes(tile_size, tile_size, rgba)
+            .map_err(|e| Error::Encode(e.to_string())),
+        TileFormat::WebP => {
+            use image::ExtendedColorType;
+            use image::codecs::webp::WebPEncoder;
+            let mut out = Vec::new();
+            WebPEncoder::new_lossless(&mut out)
+                .encode(rgba, tile_size, tile_size, ExtendedColorType::Rgba8)
+                .map_err(|e| Error::Encode(format!("webp: {e}")))?;
+            Ok(out)
+        }
+    }
 }
 
 /// Resolve the effective zoom range and shader for a run.
@@ -273,7 +313,7 @@ where
         bounds_lonlat: source.bounds_lonlat(),
         min_zoom,
         max_zoom,
-        format: "png",
+        format: opts.format.as_str(),
         json: None,
     })?;
     Ok(stats)
@@ -314,11 +354,16 @@ where
             .try_for_each_init(
                 || tx.clone(),
                 |tx, &coord| {
-                    if let Some(png) =
-                        render_tile_png(source, shader, coord, opts.tile_size, opts.resampling)?
-                    {
+                    if let Some(data) = render_tile_image(
+                        source,
+                        shader,
+                        coord,
+                        opts.tile_size,
+                        opts.resampling,
+                        opts.format,
+                    )? {
                         // The writer only hangs up on error; surfaced below.
-                        let _ = tx.send((coord, png));
+                        let _ = tx.send((coord, data));
                     }
                     progress(done.fetch_add(1, Ordering::Relaxed) + 1);
                     Ok(())
@@ -350,9 +395,10 @@ where
 {
     let mut stats = PyramidStats::default();
     for (i, &coord) in tiles.iter().enumerate() {
-        match render_tile_png(source, shader, coord, opts.tile_size, opts.resampling)? {
-            Some(png) => {
-                sink.put(coord, &png)?;
+        match render_tile_image(source, shader, coord, opts.tile_size, opts.resampling, opts.format)?
+        {
+            Some(data) => {
+                sink.put(coord, &data)?;
                 stats.written += 1;
             }
             None => stats.skipped += 1,
@@ -426,6 +472,26 @@ mod tests {
         let meta = sink.meta.unwrap();
         assert_eq!((meta.min_zoom, meta.max_zoom), (0, 4));
         assert!((meta.bounds_lonlat.0 - -5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn webp_format_produces_valid_webp_tiles() {
+        let src = source();
+        let opts = PyramidOptions {
+            min_zoom: Some(0),
+            max_zoom: Some(3),
+            format: TileFormat::WebP,
+            ..Default::default()
+        };
+        let mut sink = MemSink::new();
+        let stats = generate(&src, &opts, &mut sink, |_| {}).unwrap();
+        assert!(stats.written >= 4);
+        // WebP container: "RIFF"...."WEBP".
+        for tile in sink.tiles.values() {
+            assert_eq!(&tile[..4], b"RIFF", "expected RIFF header");
+            assert_eq!(&tile[8..12], b"WEBP", "expected WEBP fourcc");
+        }
+        assert_eq!(sink.meta.unwrap().format, "webp");
     }
 
     #[test]

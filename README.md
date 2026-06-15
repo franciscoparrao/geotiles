@@ -18,6 +18,8 @@ v0.2 — raster (XYZ/MBTiles/COG, RGB) and vector tiles (MVT).
   (`--bands 1,2,3[,4]`) and byte RGB(A) COG output
 - [x] Vector tiles (MVT) from GeoJSON/GPKG — clip, per-zoom simplification,
   MBTiles (`pbf`+gzip) or XYZ `.pbf` tree; matches GDAL's MVT output
+- [x] Lossless WebP raster tiles (`--format webp`) — ~20 % smaller than PNG,
+  pixel-identical, pure Rust (no libwebp)
 
 ## Install
 
@@ -33,6 +35,9 @@ geotiles info dem.tif
 
 # GeoTIFF → MBTiles (zooms 0..native, terrain colours)
 geotiles raster dem.tif -o dem.mbtiles --scheme terrain
+
+# Lossless WebP tiles instead of PNG (~20% smaller, pixel-identical)
+geotiles raster dem.tif -o dem.mbtiles --scheme terrain --format webp
 
 # GeoTIFF → XYZ directory, fixed zooms and stretch
 geotiles raster dem.tif -o tiles/ --min-zoom 8 --max-zoom 14 --range 0,2500

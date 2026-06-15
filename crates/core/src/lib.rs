@@ -43,7 +43,7 @@ pub use mbtiles::MbtilesSink;
 pub use mercator::{TileCoord, TileRange};
 pub use mvt::{MvtOptions, generate_mvt};
 pub use pyramid::{
-    PyramidMetadata, PyramidOptions, PyramidStats, TileSink, count_tiles, generate,
+    PyramidMetadata, PyramidOptions, PyramidStats, TileFormat, TileSink, count_tiles, generate,
 };
 pub use source::{RasterSource, Resampling, SourceCrs};
 pub use vector::{VectorFeature, VectorLayer, VectorSource};
