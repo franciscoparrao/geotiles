@@ -1,42 +1,55 @@
 <script>
   import { onMount } from 'svelte';
+  import { browser } from '$app/environment';
   import maplibregl from 'maplibre-gl';
   import 'maplibre-gl/dist/maplibre-gl.css';
+  import { Protocol, PMTiles } from 'pmtiles';
 
   let mapEl;
   let status = $state('cargando tilesets…');
 
   onMount(async () => {
-    // Both tilesets are served from MBTiles by this app's own endpoints.
-    const [relief, hidro] = await Promise.all([
-      fetch('/tiles/relief/metadata').then((r) => r.json()),
-      fetch('/tiles/hidrografia/metadata').then((r) => r.json())
-    ]);
-    const srcLayer = hidro.vector_layers?.[0]?.id ?? 'hidrografia';
-    const [w, s, e, n] = relief.bounds;
-    status = `relief z${relief.minzoom}–${relief.maxzoom} · ${hidro.name} (vector)`;
+    if (!browser) return;
+    const origin = window.location.origin;
+
+    // PMTiles: un archivo único por tileset, leído por rangos a través
+    // del protocolo pmtiles:// (registrado abajo). El endpoint
+    // /pmtiles/<layer> hace de proxy con soporte Range.
+    const protocol = new Protocol();
+    maplibregl.addProtocol('pmtiles', protocol.tile);
+
+    const header = async (layer) => {
+      // getHeader usa range requests; el proxy /pmtiles/<layer> los sirve.
+      const p = new PMTiles(`${origin}/pmtiles/${layer}`);
+      const h = await p.getHeader();
+      const meta = await p.getMetadata().catch(() => ({}));
+      return { h, meta };
+    };
+
+    const relief = await header('relief');
+    const hidro = await header('hidrografia');
+    const w = relief.h.minLon, s = relief.h.minLat;
+    const e = relief.h.maxLon, n = relief.h.maxLat;
+    const srcLayer = hidro.meta?.vector_layers?.[0]?.id ?? 'hidrografia';
+    status = `PMTiles · relief z${relief.h.minZoom}–${relief.h.maxZoom} · hidrografía (vector)`;
+
+    const sources = {
+      relief: {
+          type: 'raster',
+          tiles: [`pmtiles://${origin}/pmtiles/relief/{z}/{x}/{y}`],
+          tileSize: 256
+        },
+        hidro: {
+          type: 'vector',
+          tiles: [`pmtiles://${origin}/pmtiles/hidrografia/{z}/{x}/{y}`]
+        }
+      };
 
     const map = new maplibregl.Map({
       container: mapEl,
       style: {
         version: 8,
-        sources: {
-          relief: {
-            type: 'raster',
-            tiles: [`${location.origin}/tiles/relief/{z}/{x}/{y}`],
-            tileSize: 256,
-            minzoom: relief.minzoom,
-            maxzoom: relief.maxzoom,
-            bounds: relief.bounds
-          },
-          hidro: {
-            type: 'vector',
-            tiles: [`${location.origin}/tiles/hidrografia/{z}/{x}/{y}`],
-            minzoom: hidro.minzoom,
-            maxzoom: hidro.maxzoom,
-            bounds: hidro.bounds
-          }
-        },
+        sources,
         layers: [
           { id: 'bg', type: 'background', paint: { 'background-color': '#dfe7ef' } },
           { id: 'relief', type: 'raster', source: 'relief' },

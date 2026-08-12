@@ -1,20 +1,28 @@
 # geotiles + SvelteKit example
 
 Serve [geotiles](https://crates.io/crates/geotiles) output from a SvelteKit
-app: an endpoint reads tiles straight from an **MBTiles** file (one file,
-not thousands of loose tiles) and MapLibre renders them. Shows both a raster
-relief layer and a vector (MVT) overlay from the same app.
+app. Two backends are supported:
 
-This is the pattern to copy into your own SvelteKit sites — the reusable
-piece is [`src/lib/server/mbtiles.js`](src/lib/server/mbtiles.js) plus the
-tile endpoint.
+- **PMTiles** (default): one single-file archive per tileset, read by the
+  browser with HTTP Range requests through the `pmtiles://` protocol. The
+  app just proxies the file bytes (`/pmtiles/<layer>`); no per-tile
+  endpoint needed. This is the pattern for static/serverless hosting.
+- **MBTiles**: an endpoint reads tiles straight from an MBTiles file (one
+  file, not thousands of loose tiles).
+
+Both render a raster relief layer and a vector (MVT) overlay. Switch with
+`?backend=pmtiles` (default) or `?backend=mbtiles`.
+
+The reusable pieces are [`src/lib/server/mbtiles.js`](src/lib/server/mbtiles.js)
+(the tile endpoint) and [`src/routes/pmtiles/[layer]/+server.js`](src/routes/pmtiles/[layer]/+server.js)
+(the Range proxy).
 
 ## Run it
 
 ```bash
 # 1. Generate the demo tilesets (needs the geotiles binary on PATH)
 cargo install geotiles            # if you don't have it
-./generate-tiles.sh               # writes data/relief.mbtiles + data/hidrografia.mbtiles
+./generate-tiles.sh               # writes relief/hidrografia in .mbtiles + .pmtiles
 
 # 2. Start the app
 npm install
@@ -30,6 +38,23 @@ in another CRS must be reprojected first:
 
 ## How it works
 
+### PMTiles backend
+
+```
+data/<layer>.pmtiles  ──►  src/routes/pmtiles/[layer]/+server.js   (Range proxy)
+                               │  HTTP Range: bytes=a-b → 206 Partial Content
+                               ▼
+  +page.svelte  ──►  pmtiles.Protocol → MapLibre (pmtiles:// URLs)
+```
+
+Key detail: the endpoint **proxies the file bytes** honoring the `Range`
+header (`Content-Range` / `Accept-Ranges` / 206), so the `pmtiles` JS client
+reads the header, directory and only the tile bytes it needs. Any static
+host with Range support (S3, R2, GitHub Pages) works identically — the
+endpoint exists to make the same files work from any SvelteKit deployment.
+
+### MBTiles backend
+
 ```
 data/<layer>.mbtiles  ──►  src/lib/server/mbtiles.js   (better-sqlite3, cached)
                               │  flip XYZ y → TMS row
@@ -41,7 +66,7 @@ data/<layer>.mbtiles  ──►  src/lib/server/mbtiles.js   (better-sqlite3, ca
   +page.svelte  ──►  MapLibre raster + vector sources
 ```
 
-Key details handled by the endpoint:
+Details handled by the MBTiles endpoint:
 
 - **TMS row flip**: MBTiles stores rows bottom-up; the XYZ `y` is flipped.
 - **Content types**: `image/png` for raster, `application/x-protobuf` for
@@ -51,5 +76,5 @@ Key details handled by the endpoint:
 
 ## Files not in git
 
-`data/*.mbtiles` and `data/dem.tif` are generated locally
+`data/*.mbtiles`, `data/*.pmtiles` and `data/dem.tif` are generated locally
 (see `.gitignore`); only `data/hidrografia.geojson` is versioned.

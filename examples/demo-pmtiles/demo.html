@@ -1,0 +1,124 @@
+<!doctype html>
+<!--
+  Demo del ciclo completo: SurtGIS analiza → geotiles publica → web MapLibre.
+
+  Flujo que produjo los datos:
+    ~/.cargo/bin/surtgis terrain slope dem.tif -o slope_deg.tif --units degrees
+    ~/.cargo/bin/surtgis terrain tpi  dem.tif -o tpi.tif
+    geotiles raster dem.tif      -o relief.pmtiles    --scheme terrain  --max-zoom 12
+    geotiles raster slope_deg.tif -o slope.pmtiles    --scheme terrain  --range 0,90 --max-zoom 12
+    geotiles raster tpi.tif       -o tpi.pmtiles      --scheme divergent --range=-0.5,0.5 --max-zoom 12
+    geotiles vector hidrografia.geojson -o hidrografia.pmtiles --max-zoom 12
+
+  Uso (servir con range requests, como un bucket estático S3/R2):
+    python3 range_server.py 8734        # desde este directorio
+    abrir http://localhost:8734/demo.html
+
+  Los .pmtiles se sirven como archivos estáticos con HTTP Range: el navegador
+  pide solo las secciones que necesita. Hosting estático gratis, sin servidor.
+-->
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>geotiles demo — analizar → publicar → web</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
+  <link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/pmtiles@4/dist/pmtiles.js"></script>
+  <style>
+    html, body, #map { margin: 0; height: 100%; }
+    #legend {
+      position: absolute; bottom: 16px; left: 8px; z-index: 1;
+      background: rgba(255,255,255,.92); padding: 10px 12px; border-radius: 6px;
+      font: 13px/1.5 system-ui, sans-serif; box-shadow: 0 1px 4px rgba(0,0,0,.2);
+      min-width: 220px;
+    }
+    #legend h2 { margin: 0 0 6px; font-size: 14px; }
+    #legend label { display: block; cursor: pointer; padding: 2px 0; }
+    #legend input { margin-right: 6px; }
+    #legend .swatch { display:inline-block; width: 12px; height: 12px; margin-right: 4px;
+      border-radius: 2px; vertical-align: -1px; }
+    #hint {
+      position: absolute; top: 8px; left: 8px; z-index: 1;
+      background: rgba(255,255,255,.92); padding: 6px 10px; border-radius: 4px;
+      font: 12px/1.4 system-ui, sans-serif; box-shadow: 0 1px 4px rgba(0,0,0,.2);
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="hint">Ciclo completo: <b>SurtGIS</b> analiza → <b>geotiles</b> publica PMTiles → <b>MapLibre</b> sirve (static hosting, range requests)</div>
+  <div id="legend">
+    <h2>Capas</h2>
+    <label><input type="checkbox" data-layer="relief" checked /> <span class="swatch" style="background:#556b2f"></span> Relief (DEM)</label>
+    <label><input type="checkbox" data-layer="slope" /> <span class="swatch" style="background:#d73027"></span> Slope ° (SurtGIS)</label>
+    <label><input type="checkbox" data-layer="tpi" /> <span class="swatch" style="background:#4575b4"></span> TPI (SurtGIS)</label>
+    <label><input type="checkbox" data-layer="hidrografia" /> <span class="swatch" style="background:#00a0ff"></span> Hidrografía (vector)</label>
+  </div>
+  <script>
+    // Registra el protocolo pmtiles:// en MapLibre.
+    let protocol = new pmtiles.Protocol();
+    maplibregl.addProtocol('pmtiles', protocol.tile);
+
+    const map = new maplibregl.Map({
+      container: 'map',
+      style: {
+        version: 8,
+        sources: {
+          osm: {
+            type: 'raster',
+            tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+            tileSize: 256,
+            attribution: '© OpenStreetMap'
+          },
+          relief: {
+            type: 'raster',
+            tiles: ['pmtiles://data/relief.pmtiles/{z}/{x}/{y}'],
+            tileSize: 256
+          },
+          slope: {
+            type: 'raster',
+            tiles: ['pmtiles://data/slope.pmtiles/{z}/{x}/{y}'],
+            tileSize: 256
+          },
+          tpi: {
+            type: 'raster',
+            tiles: ['pmtiles://data/tpi.pmtiles/{z}/{x}/{y}'],
+            tileSize: 256
+          },
+          hidrografia: {
+            type: 'vector',
+            tiles: ['pmtiles://data/hidrografia.pmtiles/{z}/{x}/{y}']
+          }
+        },
+        layers: [
+          { id: 'osm', type: 'raster', source: 'osm' },
+          { id: 'relief', type: 'raster', source: 'relief' },
+          { id: 'slope', type: 'raster', source: 'slope', layout: { visibility: 'none' } },
+          { id: 'tpi', type: 'raster', source: 'tpi', layout: { visibility: 'none' } },
+          { id: 'cuencas', type: 'fill', source: 'hidrografia', 'source-layer': 'hidrografia',
+            filter: ['==', '$type', 'Polygon'],
+            paint: { 'fill-color': '#2e7d32', 'fill-opacity': 0.35 } },
+          { id: 'rios', type: 'line', source: 'hidrografia', 'source-layer': 'hidrografia',
+            filter: ['==', '$type', 'LineString'],
+            paint: { 'line-color': '#00a0ff', 'line-width': 1.5 } },
+          { id: 'estaciones', type: 'circle', source: 'hidrografia', 'source-layer': 'hidrografia',
+            filter: ['==', '$type', 'Point'],
+            paint: { 'circle-color': '#e65100', 'circle-radius': 4 } }
+        ]
+      },
+      center: [-71.02, -32.82],
+      zoom: 11,
+      maxZoom: 18
+    });
+
+    // Toggle de capas.
+    document.querySelectorAll('#legend input').forEach(input => {
+      input.addEventListener('change', () => {
+        const visibility = input.checked ? 'visible' : 'none';
+        map.setLayoutProperty(input.dataset.layer, 'visibility', visibility);
+      });
+    });
+  </script>
+</body>
+</html>

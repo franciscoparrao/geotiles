@@ -6,15 +6,21 @@ loop *analyze (SurtGIS) → publish to web (geotiles)*.
 
 ## What it does
 
-- **Raster pyramids** → XYZ `z/x/y.png` trees or MBTiles 1.3, with
+- **Raster pyramids** → XYZ `z/x/y.png` trees, MBTiles 1.3, or **PMTiles**
+  v3 (single-file archive served with HTTP Range requests), with
   nearest/bilinear sampling and area-averaged overviews.
+- **Streaming I/O**: file-backed sources read only each tile's source
+  window (memory scales with the tile, not the raster), and the PMTiles
+  sink writes tiles straight to disk. Tile formats PNG / WebP lossless /
+  JPEG lossy.
 - **16 colour schemes** (terrain, grayscale, NDVI, Imhof relief, …) via
   [`surtgis-colormap`](https://crates.io/crates/surtgis-colormap), plus
-  true-colour RGB(A) rendering from multiband sources.
+  true-colour RGB(A) rendering with a per-band stretch.
 - **Cloud Optimized GeoTIFF** writing (Float32 or byte RGB(A), deflate,
   2× overviews; passes GDAL's COG validator).
-- **MVT vector tiles** from GeoJSON/GeoPackage: clip, per-zoom
-  Douglas-Peucker simplification, quantization, protobuf encoding, gzip.
+- **MVT vector tiles** from GeoJSON/GeoPackage/Shapefile/GeoParquet: clip,
+  per-zoom Douglas-Peucker simplification, quantization, protobuf
+  encoding, gzip.
 - Parallel rendering (rayon) with a single writer thread per sink.
 
 Inputs must be in EPSG:4326 or EPSG:3857.

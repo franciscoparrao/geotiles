@@ -6,18 +6,25 @@ rasters. A "tippecanoe lite" for the SurtGIS ecosystem — closes the loop
 
 ## Status
 
-v0.2 — raster (XYZ/MBTiles/COG, RGB) and vector tiles (MVT).
+v0.4 — raster (XYZ/MBTiles/PMTiles/COG, RGB, WebP/JPEG) and vector tiles
+(MVT) with streaming I/O.
 
 - [x] Raster → XYZ tile tree (`z/x/y.png`) with resampling and full pyramid
 - [x] MBTiles 1.3 packaging (SQLite, TMS row order)
+- [x] **PMTiles v3** output (single file, HTTP Range requests, no server)
 - [x] 16 colour schemes (terrain, grayscale, NDVI, Imhof relief, …) via `surtgis-colormap`
+- [x] Tile formats: PNG, **WebP lossless**, **JPEG lossy**
 - [x] Parallel rendering (rayon) with a single writer thread
 - [x] Area-averaged sampling at overview zooms (no empty low-zoom tiles)
+- [x] **Streaming raster input** (memory ∝ tile window, not the raster)
+- [x] **Streaming PMTiles sink** (tiles written to disk as produced)
 - [x] COG writing (Float32, deflate, 2× overviews; passes GDAL's COG validator)
 - [x] RGB(A) sources: multiband GeoTIFF reader, true-colour tiles
-  (`--bands 1,2,3[,4]`) and byte RGB(A) COG output
-- [x] Vector tiles (MVT) from GeoJSON/GPKG — clip, per-zoom simplification,
-  MBTiles (`pbf`+gzip) or XYZ `.pbf` tree; matches GDAL's MVT output
+  (`--bands 1,2,3[,4]`, per-band stretch with `--band-range`) and byte
+  RGB(A) COG output
+- [x] Vector tiles (MVT) from GeoJSON/GPKG/Shapefile/GeoParquet — clip,
+  per-zoom simplification, MBTiles (`pbf`+gzip) or XYZ `.pbf` tree;
+  matches GDAL's MVT output
 
 ## Install
 
@@ -53,6 +60,21 @@ geotiles vector cuencas.geojson -o cuencas.mbtiles --max-zoom 14
 # Multi-layer tileset: each input is a layer ([name=]path[#gpkg_table])
 geotiles vector cuencas.geojson red=hidro.gpkg#rios estaciones.geojson \
   -o hidrografia.mbtiles --name hidrografia
+
+# Vector/Shapefile/GeoParquet inputs
+geotiles vector cuencas.shp rios=rios.geojson -o hidrografia.mbtiles
+geotiles vector hidrografia=hidrografia.parquet -o hidrografia.mbtiles
+
+# PMTiles: single file for static hosting (serve with any Range-capable host)
+geotiles raster dem.tif -o dem.pmtiles --scheme terrain
+geotiles vector cuencas.geojson -o cuencas.pmtiles --max-zoom 14
+
+# JPEG tiles for imagery (no alpha; transparency → black)
+geotiles raster ortho.tif -o ortho.mbtiles --bands 1,2,3 --format jpeg
+
+# Per-band stretch for RGB (Landsat-style composites)
+geotiles raster scene.tif -o rgb.mbtiles --bands 4,3,2 \
+  --band-range 0,4000;0,4000;0,4000
 ```
 
 Inputs must be in EPSG:4326 or EPSG:3857 (`--source-crs` overrides
@@ -70,13 +92,14 @@ tree served with any static file server.
 crates/
 ├── core/   geotiles-core: mercator math, sampling, pyramid, sinks
 │   ├── mercator.rs   XYZ tile math (EPSG:3857), TMS flip
-│   ├── source.rs     RasterSource: CRS detection, nearest/bilinear sampling
-│   ├── pyramid.rs    tile rendering + rayon orchestration, TileSink trait
+│   ├── source.rs     RasterSource: CRS detection, nearest/bilinear sampling, file-backed windows
+│   ├── pyramid.rs    tile rendering + rayon orchestration, TileSink trait, window budget
 │   ├── xyz.rs        z/x/y.png directory sink
 │   ├── mbtiles.rs    MBTiles 1.3 sink (rusqlite, bundled)
+│   ├── pmtiles.rs    PMTiles v3 sink (streams to disk, range-ready)
 │   ├── cog.rs        Cloud Optimized GeoTIFF writer (own TIFF encoder)
-│   ├── io.rs         multiband GeoTIFF reader (tiff crate + geo tags)
-│   ├── vector.rs     VectorSource: GeoJSON/GPKG load, reprojection, layers
+│   ├── io.rs         GeoTIFF reader + windowed chunk reads + streaming min/max
+│   ├── vector.rs     VectorSource: GeoJSON/GPKG/Shapefile/GeoParquet, reprojection, layers
 │   └── mvt.rs        MVT pyramid: clip, simplify, quantize, encode, gzip
 └── cli/    geotiles binary (clap)
 ```
@@ -90,14 +113,10 @@ pulled from crates.io, so the repo builds standalone.
 ## Known limitations
 
 - No reprojection engine: only EPSG:4326 / EPSG:3857 inputs.
-- RGB stretch is one global `--range` for all bands (per-band ranges and
-  non-linear stretches are out of scope).
-- Readers decode the full dataset into memory (same approach as
-  surtgis-core's native readers); streaming reads are future work.
 - **Vector tiles**: no tippecanoe-style feature dropping for planet-scale
   data — geotiles targets thematic layers (thousands to hundreds of
-  thousands of features). One GeoPackage table per layer spec (use several
-  `path#table` specs to pull multiple tables from one .gpkg).
+  thousands of features). One geometry type per Shapefile (cuencas/rios/
+  estaciones as separate layers).
 
 ## Validation
 

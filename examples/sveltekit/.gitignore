@@ -3,4 +3,5 @@ node_modules
 build
 # Demo tilesets and DEM are generated locally, not versioned.
 data/*.mbtiles
+data/*.pmtiles
 data/dem.tif
