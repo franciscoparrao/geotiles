@@ -3,3 +3,4 @@ data/*.pmtiles
 data/*.tif
 data/*.geojson
 data/*.aux.xml
+rs.log
