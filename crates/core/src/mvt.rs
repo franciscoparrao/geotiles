@@ -97,7 +97,10 @@ where
 }
 
 /// MBTiles 1.3 requires a `json` metadata row describing vector layers.
-fn vector_layers_json(source: &VectorSource, opts: &MvtOptions) -> String {
+///
+/// Also used by the PMTiles sink, which needs the metadata before the first
+/// tile is written (see [`crate::PmtilesSink::prepare`]).
+pub fn vector_layers_json(source: &VectorSource, opts: &MvtOptions) -> String {
     let layers: Vec<String> = source
         .layers()
         .iter()

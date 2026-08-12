@@ -1,6 +1,6 @@
 //! Tile pyramid generation: render Web Mercator tiles from a raster source.
 
-use surtgis_colormap::{ColorScheme, ColormapParams, auto_params, raster_to_rgba, rgba_to_png_bytes};
+use surtgis_colormap::{ColorScheme, ColormapParams, raster_to_rgba, rgba_to_png_bytes};
 use surtgis_core::Raster;
 
 use crate::error::{Error, Result};
@@ -23,6 +23,11 @@ pub struct PyramidOptions {
     pub scheme: ColorScheme,
     /// Fixed (min, max) stretch; default: computed from the source data.
     pub range: Option<(f64, f64)>,
+    /// Per-band `(min, max)` stretches for RGB(A) sources. When present it
+    /// takes precedence over `range`; each entry applies to the matching
+    /// colour band (indices 0..3). Shorter than the band count is fine —
+    /// missing bands fall back to (0, 255).
+    pub band_ranges: Option<Vec<(f64, f64)>>,
     /// Encoded tile image format (default PNG).
     pub format: TileFormat,
     /// Layer name recorded in the output metadata.
@@ -38,6 +43,8 @@ pub enum TileFormat {
     /// Lossless WebP (pure-Rust VP8L) — typically smaller than PNG with no
     /// quality loss.
     WebP,
+    /// Lossy JPEG (no alpha: transparency is composited onto black).
+    Jpeg,
 }
 
 impl TileFormat {
@@ -46,6 +53,7 @@ impl TileFormat {
         match self {
             TileFormat::Png => "png",
             TileFormat::WebP => "webp",
+            TileFormat::Jpeg => "jpeg",
         }
     }
 }
@@ -59,6 +67,7 @@ impl Default for PyramidOptions {
             resampling: Resampling::default(),
             scheme: ColorScheme::Grayscale,
             range: None,
+            band_ranges: None,
             format: TileFormat::Png,
             name: "geotiles".into(),
         }
@@ -100,8 +109,10 @@ pub trait TileSink {
 enum Shader {
     /// Single band through a colour scheme.
     Colormap(ColormapParams),
-    /// 3 (RGB) or 4 (RGBA) bands stretched linearly onto 0..255.
-    Rgb { lo: f64, inv_span: f64 },
+    /// 3 (RGB) or 4 (RGBA) bands stretched linearly onto 0..255. Each band
+    /// has its own `(lo, inv_span)` stretch; the alpha band reuses the
+    /// first band's stretch.
+    Rgb { stretches: Vec<(f64, f64)> },
 }
 
 /// Sample one band over the tile grid; `f(j, i, value)` receives each hit.
@@ -143,21 +154,22 @@ fn sample_grid<F: FnMut(usize, usize, f64)>(
 ///
 /// Channel values are stretched linearly from `[lo, lo + 1/inv_span]` to
 /// 0..255. Pixels where any colour band is missing become transparent; a
-/// fourth band, when present, is used as the alpha channel.
+/// fourth band, when present, is used as the alpha channel (same stretch
+/// as the first band).
 fn render_tile_rgb(
     source: &RasterSource,
     coord: TileCoord,
     tile_size: u32,
     resampling: Resampling,
     area_average: bool,
-    lo: f64,
-    inv_span: f64,
+    stretches: &[(f64, f64)],
 ) -> Option<Vec<u8>> {
     let n = tile_size as usize;
     let mut rgba = vec![0u8; n * n * 4];
     let mut hits = vec![0u8; n * n];
 
     for band in 0..3 {
+        let (lo, inv_span) = stretches.get(band).copied().unwrap_or((0.0, 1.0 / 255.0));
         sample_grid(source, band, coord, tile_size, resampling, area_average, |j, i, v| {
             let t = ((v - lo) * inv_span * 255.0).clamp(0.0, 255.0);
             rgba[(i * n + j) * 4 + band] = t as u8;
@@ -176,6 +188,7 @@ fn render_tile_rgb(
         return None;
     }
     if source.band_count() == 4 {
+        let (lo, inv_span) = stretches.first().copied().unwrap_or((0.0, 1.0 / 255.0));
         sample_grid(source, 3, coord, tile_size, resampling, area_average, |j, i, v| {
             let px = i * n + j;
             if hits[px] == 3 {
@@ -189,7 +202,30 @@ fn render_tile_rgb(
 
 /// Render one tile to an encoded image, or `None` when every pixel falls
 /// outside the source or on nodata.
+///
+/// File-backed sources render against the tile's source window (read on
+/// demand) instead of a full in-memory raster.
 fn render_tile_image(
+    source: &RasterSource,
+    shader: &Shader,
+    coord: TileCoord,
+    tile_size: u32,
+    resampling: Resampling,
+    format: TileFormat,
+) -> Result<Option<Vec<u8>>> {
+    // For file-backed sources, materialise the source window this tile
+    // needs and render against it.
+    if source.is_file_backed() {
+        let window = source.window_source(coord)?.unwrap();
+        if window.band_count() == 0 {
+            return Ok(None);
+        }
+        return render_tile_image_in_memory(&window, shader, coord, tile_size, resampling, format);
+    }
+    render_tile_image_in_memory(source, shader, coord, tile_size, resampling, format)
+}
+
+fn render_tile_image_in_memory(
     source: &RasterSource,
     shader: &Shader,
     coord: TileCoord,
@@ -218,9 +254,8 @@ fn render_tile_image(
             }
             raster_to_rgba(&tile, params)
         }
-        Shader::Rgb { lo, inv_span } => {
-            match render_tile_rgb(source, coord, tile_size, resampling, area_average, *lo, *inv_span)
-            {
+        Shader::Rgb { stretches } => {
+            match render_tile_rgb(source, coord, tile_size, resampling, area_average, stretches) {
                 Some(rgba) => rgba,
                 None => return Ok(None),
             }
@@ -243,6 +278,26 @@ fn encode_rgba(rgba: &[u8], tile_size: u32, format: TileFormat) -> Result<Vec<u8
                 .map_err(|e| Error::Encode(format!("webp: {e}")))?;
             Ok(out)
         }
+        TileFormat::Jpeg => {
+            use jpeg_encoder::{ColorType, Encoder};
+            // JPEG has no alpha: composite transparency onto black (the
+            // standard empty-tile background for raster basemaps).
+            let n = (tile_size * tile_size) as usize;
+            let mut rgb = Vec::with_capacity(n * 3);
+            for px in rgba.chunks_exact(4) {
+                let a = px[3] as u32;
+                // rgb = src*a + bg*(1-a), bg = (0,0,0) → src*a.
+                let blend = |c: u8| ((c as u32 * a) / 255) as u8;
+                rgb.push(blend(px[0]));
+                rgb.push(blend(px[1]));
+                rgb.push(blend(px[2]));
+            }
+            let mut out = Vec::new();
+            Encoder::new(&mut out, 85)
+                .encode(&rgb, tile_size as u16, tile_size as u16, ColorType::Rgb)
+                .map_err(|e| Error::Encode(format!("jpeg: {e}")))?;
+            Ok(out)
+        }
     }
 }
 
@@ -262,12 +317,32 @@ fn resolve(source: &RasterSource, opts: &PyramidOptions) -> Result<(u8, u8, Shad
     }
     let shader = if source.band_count() >= 3 {
         // RGB(A): default stretch assumes byte imagery.
-        let (lo, hi) = opts.range.unwrap_or((0.0, 255.0));
-        Shader::Rgb { lo, inv_span: 1.0 / (hi - lo) }
+        let stretches = match &opts.band_ranges {
+            Some(ranges) => ranges
+                .iter()
+                .map(|&(lo, hi)| {
+                    if hi <= lo {
+                        Err(Error::InvalidInput(format!(
+                            "invalid band stretch range: {lo}..{hi}"
+                        )))
+                    } else {
+                        Ok((lo, 1.0 / (hi - lo)))
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?,
+            None => {
+                let (lo, hi) = opts.range.unwrap_or((0.0, 255.0));
+                vec![(lo, 1.0 / (hi - lo))]
+            }
+        };
+        Shader::Rgb { stretches }
     } else {
         Shader::Colormap(match opts.range {
             Some((lo, hi)) => ColormapParams::with_range(opts.scheme, lo, hi),
-            None => auto_params(source.raster(), opts.scheme),
+            None => {
+                let (lo, hi) = source.minmax()?;
+                ColormapParams::with_range(opts.scheme, lo, hi)
+            }
         })
     };
     Ok((min_zoom, max_zoom, shader))
@@ -286,6 +361,25 @@ pub fn count_tiles(source: &RasterSource, opts: &PyramidOptions) -> Result<u64> 
 
 /// Generate the full pyramid into `sink`.
 ///
+/// The [`PyramidMetadata`] a run will hand to the sink's `finalize`.
+///
+/// Exposed so streaming sinks that need header/metadata *before* any tile
+/// (e.g. [`crate::PmtilesSink`]) can prepare with the same values.
+pub fn pyramid_metadata(
+    source: &RasterSource,
+    opts: &PyramidOptions,
+) -> Result<PyramidMetadata> {
+    let (min_zoom, max_zoom, _) = resolve(source, opts)?;
+    Ok(PyramidMetadata {
+        name: opts.name.clone(),
+        bounds_lonlat: source.bounds_lonlat(),
+        min_zoom,
+        max_zoom,
+        format: opts.format.as_str(),
+        json: None,
+    })
+}
+
 /// Tiles are rendered in parallel (rayon) and handed to the sink from a
 /// single writer thread, so sinks need no internal synchronization.
 /// `progress` is invoked once per processed tile with the running count.
@@ -335,9 +429,18 @@ where
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
 
     let done = AtomicU64::new(0);
     let (tx, rx) = mpsc::sync_channel::<(TileCoord, Vec<u8>)>(256);
+
+    // Cap total in-flight window memory for file-backed sources: each tile
+    // materialises its source window, and overview tiles (which span most
+    // of the raster) would otherwise stack several full-raster copies under
+    // Rayon's parallelism. A per-byte semaphore keeps the peak bounded.
+    const WINDOW_BUDGET: usize = 512 * 1024 * 1024; // 512 MiB in-flight
+    let window_sem = Arc::new(Mutex::new(WINDOW_BUDGET));
+    let window_cond = Arc::new(std::sync::Condvar::new());
 
     std::thread::scope(|scope| {
         let writer = scope.spawn(move || -> Result<u64> {
@@ -352,16 +455,32 @@ where
         let render_result: Result<()> = tiles
             .par_iter()
             .try_for_each_init(
-                || tx.clone(),
-                |tx, &coord| {
-                    if let Some(data) = render_tile_image(
+                || (tx.clone(), window_sem.clone(), window_cond.clone()),
+                |(tx, sem, cond), &coord| {
+                    // Wait until enough window budget is free to render this
+                    // tile. In-memory sources always fit (no window).
+                    let need = source.window_bytes(coord).unwrap_or(0);
+                    {
+                        let mut budget = sem.lock().unwrap();
+                        while *budget < need {
+                            budget = cond.wait(budget).unwrap();
+                        }
+                        *budget -= need;
+                    }
+                    let rendered = render_tile_image(
                         source,
                         shader,
                         coord,
                         opts.tile_size,
                         opts.resampling,
                         opts.format,
-                    )? {
+                    );
+                    {
+                        let mut budget = sem.lock().unwrap();
+                        *budget += need;
+                        cond.notify_all();
+                    }
+                    if let Some(data) = rendered? {
                         // The writer only hangs up on error; surfaced below.
                         let _ = tx.send((coord, data));
                     }
@@ -495,6 +614,177 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_matches_in_memory_pyramid() {
+        // A raster with a gradient and a nodata corner, written as a tiled
+        // COG. Tiling it twice — in-memory and file-backed — must produce
+        // byte-identical tiles.
+        let n = 128;
+        let mut r = Raster::new(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                let v = if i < 4 || j < 4 {
+                    f64::NAN
+                } else {
+                    (i * 10 + j) as f64
+                };
+                r.set(i, j, v).unwrap();
+            }
+        }
+        r.set_transform(GeoTransform::new(-71.0, -33.0, 0.01, -0.01));
+        r.set_crs(Some(CRS::from_epsg(4326)));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stream.tif");
+        crate::cog::write_cog(&r, &path, &crate::cog::CogOptions {
+            tile_size: 32,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let in_mem = RasterSource::new(r, None).unwrap();
+        let file_backed = RasterSource::open_file(&path, &[0], None).unwrap();
+
+        let opts = PyramidOptions {
+            min_zoom: Some(0),
+            max_zoom: Some(4),
+            range: Some((0.0, 1300.0)),
+            ..Default::default()
+        };
+        let mut sink_a = MemSink::new();
+        generate(&in_mem, &opts, &mut sink_a, |_| {}).unwrap();
+        let mut sink_b = MemSink::new();
+        generate(&file_backed, &opts, &mut sink_b, |_| {}).unwrap();
+
+        assert_eq!(sink_a.tiles.len(), sink_b.tiles.len());
+        for (coord, bytes) in &sink_a.tiles {
+            assert_eq!(
+                bytes,
+                sink_b.tiles.get(coord).expect("same tile in file-backed"),
+                "tile {coord:?} differs between in-memory and file-backed"
+            );
+        }
+    }
+
+    #[test]
+    fn file_backed_window_is_small() {
+        // A 2000x2000 raster covering 1° of lon/lat. A tile at z12 covers
+        // roughly 1/512 of the source width, so the window it reads must be
+        // a small fraction of the raster, not the whole thing.
+        let n = 2000;
+        let mut r = Raster::new(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                r.set(i, j, (i + j) as f64).unwrap();
+            }
+        }
+        r.set_transform(GeoTransform::new(-71.5, -32.5, 1.0 / n as f64, -1.0 / n as f64));
+        r.set_crs(Some(CRS::from_epsg(4326)));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stream.tif");
+        crate::cog::write_cog(&r, &path, &crate::cog::CogOptions {
+            tile_size: 256,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let src = RasterSource::open_file(&path, &[0], None).unwrap();
+        assert!(src.is_file_backed());
+
+        // Pick a real tile inside the raster bounds at z12.
+        let bounds = src.bounds_meters();
+        let coord = TileRange::for_bounds(bounds, 12).iter().next().unwrap();
+        let win = src.window_source(coord).unwrap().unwrap();
+        let (rows, cols) = win.band(0).shape();
+        // Tile spans ~4096/360° ≈ 11.4 px/tile; with margin ~20px each way
+        // the window must be well under 100px, not the full 2000.
+        assert!(cols < 100 && rows < 100, "window too large: {rows}x{cols}");
+        // And it must match the full raster's values.
+        let full = RasterSource::new(r, None).unwrap();
+        let full_win = full.window_source(coord).unwrap(); // None for memory
+        assert!(full_win.is_none());
+    }
+
+    #[test]
+    fn jpeg_format_produces_valid_jpeg_tiles() {
+        let src = source();
+        let opts = PyramidOptions {
+            min_zoom: Some(0),
+            max_zoom: Some(3),
+            format: TileFormat::Jpeg,
+            ..Default::default()
+        };
+        let mut sink = MemSink::new();
+        let stats = generate(&src, &opts, &mut sink, |_| {}).unwrap();
+        assert!(stats.written >= 4);
+        // JPEG SOI marker 0xFFD8.
+        for tile in sink.tiles.values() {
+            assert_eq!(&tile[..2], &[0xFF, 0xD8], "expected JPEG SOI marker");
+        }
+        assert_eq!(sink.meta.unwrap().format, "jpeg");
+    }
+
+    #[test]
+    fn jpeg_composites_transparency_on_black() {
+        // Constant RGB bands (r=200,g=100,b=50) with a transparent top-left
+        // corner (nodata). JPEG has no alpha, so that corner must come out
+        // black after decode.
+        let n = 64;
+        let mut bands = vec![];
+        for value in [200.0, 100.0, 50.0] {
+            let mut r = Raster::filled(n, n, f64::NAN);
+            for j in 0..n {
+                for i in 0..n {
+                    if i >= 2 && j >= 2 {
+                        r.set(i, j, value).unwrap();
+                    }
+                }
+            }
+            r.set_transform(GeoTransform::new(-5.0, 5.0, 10.0 / n as f64, -10.0 / n as f64));
+            r.set_crs(Some(CRS::from_epsg(4326)));
+            bands.push(r);
+        }
+        let src = RasterSource::new_multi(bands, None).unwrap();
+
+        let opts = PyramidOptions {
+            min_zoom: Some(0),
+            max_zoom: Some(1),
+            format: TileFormat::Jpeg,
+            ..Default::default()
+        };
+        let mut sink = MemSink::new();
+        generate(&src, &opts, &mut sink, |_| {}).unwrap();
+
+        let Some(bytes) = sink.tiles.get(&(0, 0, 0)) else {
+            panic!("expected zoom-0 tile");
+        };
+        let decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(bytes));
+        let mut decoder = decoder;
+        let pixels = decoder.decode().expect("decode jpeg tile");
+        let info = decoder.info().expect("jpeg info");
+        let stride = match info.pixel_format {
+            jpeg_decoder::PixelFormat::RGB24 => 3,
+            jpeg_decoder::PixelFormat::L8 => 1,
+            _ => 3,
+        };
+        let get = |i: usize, j: usize| {
+            let off = (j * info.width as usize + i) * stride;
+            let (r, g, b) = (pixels[off], pixels[off + 1], pixels[off + 2]);
+            r.max(g).max(b)
+        };
+        assert!(get(0, 0) <= 40, "transparent corner should be near-black");
+        // Tile (0,0,0) spans the whole world; the source occupies its centre
+        // (-5..5° lon/lat ≈ mercator 0,0). A centre pixel is opaque data.
+        let cx = info.width as usize / 2;
+        let cy = info.height as usize / 2;
+        assert!(
+            get(cx, cy) > 100,
+            "opaque centre should be bright, got {}",
+            get(cx, cy)
+        );
+    }
+
+    #[test]
     fn count_matches_enumeration() {
         let src = source();
         let opts = PyramidOptions {
@@ -536,8 +826,64 @@ mod tests {
     }
 
     #[test]
-    fn rgba_alpha_band_controls_transparency() {
-        let n = 64;
+    fn band_ranges_stretch_each_channel_independently() {
+        // Bands hold 0..255 and cover the whole world (-180..180). With
+        // per-band ranges that each map the stored value to a different
+        // output level, the tile's channels must come out at those levels.
+        let n = 32;
+        let mut bands = vec![];
+        for value in [128.0, 64.0, 192.0] {
+            let mut r = Raster::filled(n, n, value);
+            r.set_transform(GeoTransform::new(-180.0, 180.0, 360.0 / n as f64, -360.0 / n as f64));
+            r.set_crs(Some(CRS::from_epsg(4326)));
+            bands.push(r);
+        }
+        let src = RasterSource::new_multi(bands, None).unwrap();
+
+        let opts = PyramidOptions {
+            min_zoom: Some(3),
+            max_zoom: Some(3),
+            // value 128 in 0..256 → ~127; value 64 in 0..64 → 255; value
+            // 192 in 128..256 → ~128.
+            band_ranges: Some(vec![(0.0, 256.0), (0.0, 64.0), (128.0, 256.0)]),
+            ..Default::default()
+        };
+        let mut sink = MemSink::new();
+        generate(&src, &opts, &mut sink, |_| {}).unwrap();
+
+        // Decode one tile (PNG) and check the three channels at its centre.
+        let data = sink.tiles.values().next().expect("at least one tile");
+        let img = image::load_from_memory(data).unwrap().to_rgba8();
+        let (cx, cy) = (img.width() / 2, img.height() / 2);
+        let px = img.get_pixel(cx, cy);
+        assert!((px.0[0] as i32 - 127).abs() <= 2, "R={}", px.0[0]);
+        assert!((px.0[1] as i32 - 255).abs() <= 2, "G={}", px.0[1]);
+        assert!((px.0[2] as i32 - 128).abs() <= 2, "B={}", px.0[2]);
+    }
+
+    #[test]
+    fn invalid_band_range_is_rejected() {
+        let n = 32;
+        let mut bands = vec![];
+        for value in [128.0, 100.0, 50.0] {
+            let mut r = Raster::filled(n, n, value);
+            r.set_transform(GeoTransform::new(-5.0, 5.0, 10.0 / n as f64, -10.0 / n as f64));
+            r.set_crs(Some(CRS::from_epsg(4326)));
+            bands.push(r);
+        }
+        let src = RasterSource::new_multi(bands, None).unwrap();
+        let opts = PyramidOptions {
+            min_zoom: Some(0),
+            max_zoom: Some(1),
+            band_ranges: Some(vec![(0.0, 0.0)]),
+            ..Default::default()
+        };
+        let mut sink = MemSink::new();
+        assert!(generate(&src, &opts, &mut sink, |_| {}).is_err());
+    }
+
+    #[test]
+    fn rgba_alpha_band_controls_transparency() {        let n = 64;
         let mut bands = vec![];
         for value in [200.0, 100.0, 50.0, 0.0] {
             let mut r = Raster::filled(n, n, value);
