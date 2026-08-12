@@ -25,6 +25,9 @@ image.workspace = true
 jpeg-encoder.workspace = true
 pmtiles.workspace = true
 mvt.workspace = true
+flatgeobuf.workspace = true
+geozero.workspace = true
+fallible-streaming-iterator.workspace = true
 geo.workspace = true
 geo-types.workspace = true
 rayon = { workspace = true, optional = true }

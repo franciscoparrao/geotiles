@@ -132,7 +132,8 @@ impl VectorSource {
 ///
 /// surtgis-core v1.0+ handles GeoJSON with all geometry types (including
 /// LineString and MultiPoint), so the custom parser is no longer needed.
-/// v1.1 adds Shapefile and full-geometry GeoParquet readers.
+/// v1.1 adds Shapefile and full-geometry GeoParquet readers; v0.4 of
+/// geotiles adds FlatGeobuf (streaming, via geozero → geo-types).
 fn read_file(path: &Path, gpkg_layer: Option<&str>) -> Result<FeatureCollection> {
     let ext = path
         .extension()
@@ -143,7 +144,111 @@ fn read_file(path: &Path, gpkg_layer: Option<&str>) -> Result<FeatureCollection>
         "gpkg" => Ok(surtgis_core::vector::read_gpkg(path, gpkg_layer)?),
         "shp" => Ok(surtgis_core::vector::read_shapefile(path)?),
         "parquet" => Ok(surtgis_core::vector::read_geoparquet(path)?),
+        "fgb" => read_flatgeobuf(path),
         _ => Ok(surtgis_core::vector::read_vector(path)?),
+    }
+}
+
+/// Read a FlatGeobuf file into a `FeatureCollection`.
+///
+/// Streams features via the `flatgeobuf` crate. Each feature's geometry is
+/// decoded with geozero's `GeoWriter` (→ `geo_types::Geometry`) and its
+/// properties via a small `PropertyProcessor`. The file's CRS is read from
+/// the FGB header when it carries an EPSG code.
+fn read_flatgeobuf(path: &Path) -> Result<FeatureCollection> {
+    use fallible_streaming_iterator::FallibleStreamingIterator;
+    use geozero::geo_types::GeoWriter;
+    use geozero::{FeatureProperties, GeozeroGeometry};
+    use std::io::BufReader;
+
+    let file = std::fs::File::open(path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut fgb = flatgeobuf::FgbReader::open(BufReader::new(file))
+        .map_err(|e| Error::InvalidInput(format!("{}: {e}", path.display())))?
+        .select_all()
+        .map_err(|e| Error::InvalidInput(format!("{}: {e}", path.display())))?;
+
+    // CRS from the FGB header (EPSG code when available).
+    let header = fgb.header();
+    let crs = header
+        .crs()
+        .map(|c| surtgis_core::CRS::from_epsg(c.code() as u32));
+    let mut fc = FeatureCollection::with_crs(crs);
+
+    let mut props = PropertyAccumulator::default();
+    while let Some(feature) = fgb
+        .next()
+        .map_err(|e| Error::InvalidInput(format!("{}: {e}", path.display())))?
+    {
+        let mut gw = GeoWriter::new();
+        feature
+            .process_geom(&mut gw)
+            .map_err(|e| Error::InvalidInput(format!("{}: {e}", path.display())))?;
+        let Some(geometry) = gw.take_geometry() else {
+            continue;
+        };
+        props.clear();
+        feature
+            .process_properties(&mut props)
+            .map_err(|e| Error::InvalidInput(format!("{}: {e}", path.display())))?;
+
+        let mut f = surtgis_core::vector::Feature::new(geometry);
+        for (name, value) in props.take() {
+            f.set_property(name, fgb_value_to_attribute(&value));
+        }
+        fc.push(f);
+    }
+    Ok(fc)
+}
+
+/// Collects feature properties as they stream through a `PropertyProcessor`.
+#[derive(Default)]
+struct PropertyAccumulator {
+    map: Vec<(String, geozero::geo_types::OwnedColumnValue)>,
+}
+
+impl PropertyAccumulator {
+    fn clear(&mut self) {
+        self.map.clear();
+    }
+    fn take(&mut self) -> Vec<(String, geozero::geo_types::OwnedColumnValue)> {
+        std::mem::take(&mut self.map)
+    }
+}
+
+impl geozero::PropertyProcessor for PropertyAccumulator {
+    fn property(
+        &mut self,
+        _idx: usize,
+        name: &str,
+        value: &geozero::ColumnValue,
+    ) -> geozero::error::Result<bool> {
+        use geozero::geo_types::OwnedColumnValue;
+        self.map.push((name.to_string(), OwnedColumnValue::from(value)));
+        // false = keep processing remaining properties.
+        Ok(false)
+    }
+}
+
+/// Map a geozero `OwnedColumnValue` to surtgis' `AttributeValue`.
+fn fgb_value_to_attribute(v: &geozero::geo_types::OwnedColumnValue) -> AttributeValue {
+    use geozero::geo_types::OwnedColumnValue as V;
+    match v {
+        V::Byte(x) => AttributeValue::Int(*x as i64),
+        V::UByte(x) => AttributeValue::Int(*x as i64),
+        V::Short(x) => AttributeValue::Int(*x as i64),
+        V::UShort(x) => AttributeValue::Int(*x as i64),
+        V::Int(x) => AttributeValue::Int(*x as i64),
+        V::UInt(x) => AttributeValue::Int(*x as i64),
+        V::Long(x) => AttributeValue::Int(*x),
+        V::ULong(x) => AttributeValue::Float(*x as f64),
+        V::Bool(x) => AttributeValue::Bool(*x),
+        V::Float(x) => AttributeValue::Float(*x as f64),
+        V::Double(x) => AttributeValue::Float(*x),
+        V::String(s) | V::Json(s) | V::DateTime(s) => AttributeValue::String(s.clone()),
+        V::Binary(_) => AttributeValue::Null,
     }
 }
 
@@ -543,6 +648,36 @@ mod tests {
         assert!(named.properties.iter().any(
             |(k, v)| k == "estacion" && matches!(v, AttributeValue::String(s) if s == "E01")
         ));
+    }
+
+    #[test]
+    fn reads_flatgeobuf_input() {
+        // Reads a GDAL-produced .fgb fixture (tests/fixtures/cuencas.fgb).
+        // The flatgeobuf crate's own writer is buggy for properties (its
+        // column registration drops feature values — GDAL rejects those
+        // files), so the fixture comes from GDAL, the reference writer.
+        let fgb_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/cuencas.fgb");
+
+        let src = VectorSource::from_file(&fgb_path, "cuencas", None, None).unwrap();
+        let layer = &src.layers()[0];
+        assert_eq!(layer.name, "cuencas");
+        assert_eq!(layer.features.len(), 1);
+        // GDAL's writer may keep it as Polygon or promote to MultiPolygon.
+        assert!(matches!(
+            layer.features[0].geometry,
+            Geometry::Polygon(_) | Geometry::MultiPolygon(_)
+        ));
+        let props = &layer.features[0].properties;
+        assert!(props.iter().any(
+            |(k, v)| k == "name" && matches!(v, AttributeValue::String(s) if s == "Cuenca1")
+        ));
+        assert!(props.iter().any(
+            |(k, v)| k == "area_km2" && matches!(v, AttributeValue::Float(x) if (*x - 12.5).abs() < 1e-9)
+        ));
+        // Reprojected to mercator.
+        let (x0, _, _, _) = src.bounds_meters();
+        assert!(x0 < -7.9e6, "expected mercator, got {x0}");
     }
 
     #[test]

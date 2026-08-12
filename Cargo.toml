@@ -28,6 +28,10 @@ mvt = "0.13"
 # geo must match surtgis-core's major (shared i_overlay/i_float tree).
 geo = "0.29"
 geo-types = "0.7"
+# FlatGeobuf vector input (streaming). geozero bridges FGB → geo-types.
+flatgeobuf = { version = "6.0", default-features = false }
+geozero = { version = "0.15", default-features = false, features = ["with-geo", "with-geojson"] }
+fallible-streaming-iterator = "0.1"
 
 # Storage
 # Must match surtgis-core's rusqlite major (shared native libsqlite3-sys).
