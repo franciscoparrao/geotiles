@@ -3,11 +3,19 @@
 //! v0.1 supports sources in EPSG:4326 (lon/lat) and EPSG:3857 (Web Mercator).
 //! Reprojection between those and the tile grid is analytic, so no external
 //! projection engine is needed.
+//!
+//! v0.4 adds a file-backed source: a GeoTIFF is opened for its metadata and
+//! each tile renders against the *window* of source pixels it needs, read on
+//! demand (see [`RasterSource::window_source`]). Memory scales with the tile
+//! window instead of the whole raster.
 
+use std::path::{Path, PathBuf};
+
+use surtgis_core::GeoTransform;
 use surtgis_core::Raster;
 
 use crate::error::{Error, Result};
-use crate::mercator::{self, MAX_LATITUDE_DEG, ORIGIN_SHIFT_M};
+use crate::mercator::{self, TileCoord, MAX_LATITUDE_DEG, ORIGIN_SHIFT_M};
 
 /// Coordinate system of the source raster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,11 +36,31 @@ pub enum Resampling {
     Bilinear,
 }
 
+/// Where a source's pixel data lives.
+#[derive(Debug)]
+enum SourceData {
+    /// Bands fully decoded in memory.
+    Memory(Vec<Raster<f64>>),
+    /// GeoTIFF on disk: metadata only, pixels read window-by-window.
+    File(FileSource),
+}
+
+/// Metadata for a file-backed source; no pixel data.
+#[derive(Debug)]
+struct FileSource {
+    path: PathBuf,
+    /// 0-based source band indices served.
+    bands: Vec<usize>,
+    rows: usize,
+    cols: usize,
+    transform: GeoTransform,
+}
+
 /// A tileable raster: 1 (gray), 3 (RGB) or 4 (RGBA) co-registered bands
 /// plus the analytic projection to Web Mercator.
 #[derive(Debug)]
 pub struct RasterSource {
-    bands: Vec<Raster<f64>>,
+    data: SourceData,
     crs: SourceCrs,
 }
 
@@ -89,12 +117,78 @@ impl RasterSource {
             Some(crs) => crs,
             None => Self::detect_crs(first)?,
         };
-        Ok(Self { bands, crs })
+        Ok(Self { data: SourceData::Memory(bands), crs })
+    }
+
+    /// Open a GeoTIFF for streaming tiling without loading its pixels.
+    ///
+    /// Only the header is read; [`RasterSource::window_source`] reads the
+    /// pixels each tile needs. `bands` are 0-based source band indices.
+    pub fn open_file(
+        path: impl AsRef<Path>,
+        bands: &[usize],
+        crs_override: Option<SourceCrs>,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        if !matches!(bands.len(), 1 | 3 | 4) {
+            return Err(Error::InvalidInput(format!(
+                "expected 1, 3 or 4 bands, got {}",
+                bands.len()
+            )));
+        }
+        let meta = crate::io::read_meta(path, bands)?;
+        if !meta.transform.is_north_up() {
+            return Err(Error::InvalidInput(
+                "rotated rasters are not supported; warp to north-up first".into(),
+            ));
+        }
+        let crs = match crs_override {
+            Some(crs) => crs,
+            None => match meta.crs.as_ref().and_then(|c| c.epsg()) {
+                Some(4326) => SourceCrs::LonLat,
+                Some(3857) | Some(900_913) => SourceCrs::Mercator,
+                Some(other) => {
+                    return Err(Error::InvalidInput(format!(
+                        "unsupported source CRS EPSG:{other}; reproject to EPSG:4326 or \
+                         EPSG:3857 first, or pass an explicit --source-crs override"
+                    )));
+                }
+                None => {
+                    // Bounds heuristic, mirroring detect_crs.
+                    let looks_geographic = meta.transform.origin_x >= -180.5
+                        && meta.transform.origin_x + meta.cols as f64 * meta.transform.pixel_width
+                            <= 180.5;
+                    if looks_geographic {
+                        SourceCrs::LonLat
+                    } else {
+                        SourceCrs::Mercator
+                    }
+                }
+            },
+        };
+        Ok(Self {
+            data: SourceData::File(FileSource {
+                path: path.to_path_buf(),
+                bands: bands.to_vec(),
+                rows: meta.rows,
+                cols: meta.cols,
+                transform: meta.transform,
+            }),
+            crs,
+        })
     }
 
     /// Number of bands (1, 3 or 4).
     pub fn band_count(&self) -> usize {
-        self.bands.len()
+        match &self.data {
+            SourceData::Memory(bands) => bands.len(),
+            SourceData::File(f) => f.bands.len(),
+        }
+    }
+
+    /// Whether pixels are read from disk per tile rather than held in RAM.
+    pub fn is_file_backed(&self) -> bool {
+        matches!(self.data, SourceData::File(_))
     }
 
     fn detect_crs(raster: &Raster<f64>) -> Result<SourceCrs> {
@@ -133,18 +227,119 @@ impl RasterSource {
     }
 
     /// Borrow the first band (the only band for single-band sources).
+    ///
+    /// Only available for in-memory sources.
     pub fn raster(&self) -> &Raster<f64> {
-        &self.bands[0]
+        let SourceData::Memory(bands) = &self.data else {
+            unreachable!("raster() requires an in-memory source; use window_source");
+        };
+        &bands[0]
     }
 
     /// Borrow a band by 0-based index.
+    ///
+    /// Only available for in-memory sources.
     pub fn band(&self, b: usize) -> &Raster<f64> {
-        &self.bands[b]
+        let SourceData::Memory(bands) = &self.data else {
+            unreachable!("band() requires an in-memory source; use window_source");
+        };
+        &bands[b]
+    }
+
+    /// Access a band if the source is in memory.
+    fn band_opt(&self, b: usize) -> Option<&Raster<f64>> {
+        let SourceData::Memory(bands) = &self.data else {
+            return None;
+        };
+        bands.get(b)
+    }
+
+    /// The source pixel window `(col0, row0, width, height)` that `coord`
+    /// maps onto, clamped to the raster. `None` if the tile doesn't
+    /// intersect the source or the source is in memory.
+    pub fn window_rect(&self, coord: TileCoord) -> Option<(i64, i64, usize, usize)> {
+        let SourceData::File(f) = &self.data else {
+            return None;
+        };
+        let (min_mx, min_my, max_mx, max_my) = coord.bounds_meters();
+        let ((sx0, sy0), (sx1, sy1)) = match self.crs {
+            SourceCrs::Mercator => ((min_mx, max_my), (max_mx, min_my)),
+            SourceCrs::LonLat => (
+                mercator::meters_to_lonlat(min_mx, max_my),
+                mercator::meters_to_lonlat(max_mx, min_my),
+            ),
+        };
+        let (ca, ra) = f.transform.geo_to_pixel(sx0, sy0);
+        let (cb, rb) = f.transform.geo_to_pixel(sx1, sy1);
+        if !ca.is_finite() || !cb.is_finite() || !ra.is_finite() || !rb.is_finite() {
+            return None;
+        }
+        const MARGIN: i64 = 2;
+        let col0 = ((ca.min(cb)).floor() as i64 - MARGIN).max(0);
+        let row0 = ((ra.min(rb)).floor() as i64 - MARGIN).max(0);
+        let col1 = ((ca.max(cb)).ceil() as i64 + MARGIN).min(f.cols as i64);
+        let row1 = ((ra.max(rb)).ceil() as i64 + MARGIN).min(f.rows as i64);
+        let width = (col1 - col0) as usize;
+        let height = (row1 - row0) as usize;
+        if width == 0 || height == 0 {
+            return None;
+        }
+        Some((col0, row0, width, height))
+    }
+
+    /// Estimated in-memory bytes of the window `coord` needs (file-backed).
+    ///
+    /// Used by the renderer to bound total in-flight window memory.
+    pub fn window_bytes(&self, coord: TileCoord) -> Option<usize> {
+        let (_, _, width, height) = self.window_rect(coord)?;
+        Some(width * height * self.band_count() * size_of::<f64>())
+    }
+
+    /// Materialise the window of source pixels that `coord` needs, as an
+    /// in-memory source whose top-left pixel is the window's top-left.
+    ///
+    /// File-backed sources call this once per tile; in-memory sources
+    /// return `None` (they are already fully available).
+    pub fn window_source(&self, coord: TileCoord) -> Result<Option<RasterSource>> {
+        let SourceData::File(f) = &self.data else {
+            return Ok(None);
+        };
+        let Some((col0, row0, width, height)) = self.window_rect(coord) else {
+            return Ok(Some(RasterSource {
+                data: SourceData::Memory(vec![]),
+                crs: self.crs,
+            }));
+        };
+
+        let mut window_bands = Vec::with_capacity(f.bands.len());
+        for &band in &f.bands {
+            window_bands.push(crate::io::read_band_window(
+                &f.path,
+                band,
+                col0,
+                row0,
+                width,
+                height,
+            )?);
+        }
+        let source = Self {
+            data: SourceData::Memory(window_bands),
+            crs: self.crs,
+        };
+        Ok(Some(source))
     }
 
     /// Source bounds in Web Mercator meters `(min_x, min_y, max_x, max_y)`.
     pub fn bounds_meters(&self) -> (f64, f64, f64, f64) {
-        let (min_x, min_y, max_x, max_y) = self.bands[0].bounds();
+        let (min_x, min_y, max_x, max_y) = match &self.data {
+            SourceData::Memory(bands) => bands[0].bounds(),
+            SourceData::File(f) => {
+                let (x0, y0) = f.transform.pixel_to_geo_corner(0, 0);
+                let (x1, y1) =
+                    f.transform.pixel_to_geo_corner(f.cols, f.rows);
+                (x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1))
+            }
+        };
         match self.crs {
             SourceCrs::Mercator => (min_x, min_y, max_x, max_y),
             SourceCrs::LonLat => {
@@ -159,7 +354,14 @@ impl RasterSource {
 
     /// Source bounds in lon/lat degrees `(west, south, east, north)`.
     pub fn bounds_lonlat(&self) -> (f64, f64, f64, f64) {
-        let (min_x, min_y, max_x, max_y) = self.bands[0].bounds();
+        let (min_x, min_y, max_x, max_y) = match &self.data {
+            SourceData::Memory(bands) => bands[0].bounds(),
+            SourceData::File(f) => {
+                let (x0, y0) = f.transform.pixel_to_geo_corner(0, 0);
+                let (x1, y1) = f.transform.pixel_to_geo_corner(f.cols, f.rows);
+                (x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1))
+            }
+        };
         match self.crs {
             SourceCrs::LonLat => (min_x, min_y, max_x, max_y),
             SourceCrs::Mercator => {
@@ -175,7 +377,10 @@ impl RasterSource {
     /// For lon/lat sources this uses the equatorial conversion
     /// (deg × πR/180), matching gdal2tiles' zoom selection.
     pub fn native_resolution_m(&self) -> f64 {
-        let cell = self.bands[0].cell_size();
+        let cell = match &self.data {
+            SourceData::Memory(bands) => bands[0].cell_size(),
+            SourceData::File(f) => f.transform.cell_size(),
+        };
         match self.crs {
             SourceCrs::Mercator => cell,
             SourceCrs::LonLat => cell * ORIGIN_SHIFT_M / 180.0,
@@ -185,6 +390,46 @@ impl RasterSource {
     /// Natural maximum zoom: tiling deeper than this adds no detail.
     pub fn native_max_zoom(&self, tile_size: u32) -> u8 {
         mercator::zoom_for_resolution(self.native_resolution_m(), tile_size)
+    }
+
+    /// Data range `(min, max)` of the first band's finite values.
+    ///
+    /// File-backed sources scan the file window-by-window so memory stays
+    /// bounded; in-memory sources read the band directly.
+    pub fn minmax(&self) -> Result<(f64, f64)> {
+        match &self.data {
+            SourceData::Memory(bands) => {
+                let raster = &bands[0];
+                let mut min = f64::INFINITY;
+                let mut max = f64::NEG_INFINITY;
+                for val in raster.data().iter() {
+                    if val.is_nan() || raster.is_nodata(*val) {
+                        continue;
+                    }
+                    if *val < min {
+                        min = *val;
+                    }
+                    if *val > max {
+                        max = *val;
+                    }
+                }
+                if !min.is_finite() || !max.is_finite() {
+                    Ok((0.0, 1.0))
+                } else if (max - min).abs() < f64::EPSILON {
+                    Ok((min, min + 1.0))
+                } else {
+                    Ok((min, max))
+                }
+            }
+            SourceData::File(f) => {
+                let (min, max) = crate::io::band_minmax(&f.path, f.bands[0])?;
+                if (max - min).abs() < f64::EPSILON {
+                    Ok((min, min + 1.0))
+                } else {
+                    Ok((min, max))
+                }
+            }
+        }
     }
 
     /// Sample the first band at a Web Mercator point. `None` means outside
@@ -199,7 +444,7 @@ impl RasterSource {
             SourceCrs::Mercator => (mx, my),
             SourceCrs::LonLat => mercator::meters_to_lonlat(mx, my),
         };
-        let (col, row) = self.bands[band].geo_to_pixel(sx, sy);
+        let (col, row) = self.band_opt(band)?.geo_to_pixel(sx, sy);
         if !col.is_finite() || !row.is_finite() {
             return None;
         }
@@ -236,8 +481,8 @@ impl RasterSource {
                 mercator::meters_to_lonlat(mx1, my1),
             ),
         };
-        let (ca, ra) = self.bands[band].geo_to_pixel(sx0.min(sx1), sy0.max(sy1));
-        let (cb, rb) = self.bands[band].geo_to_pixel(sx0.max(sx1), sy0.min(sy1));
+        let (ca, ra) = self.band_opt(band)?.geo_to_pixel(sx0.min(sx1), sy0.max(sy1));
+        let (cb, rb) = self.band_opt(band)?.geo_to_pixel(sx0.max(sx1), sy0.min(sy1));
         if !ca.is_finite() || !cb.is_finite() || !ra.is_finite() || !rb.is_finite() {
             return None;
         }
@@ -260,7 +505,7 @@ impl RasterSource {
 
         // Intersect with the raster so footprints that poke outside don't
         // iterate over (possibly millions of) nonexistent cells.
-        let raster = &self.bands[band];
+        let raster = self.band_opt(band)?;
         let col_start = col_start.max(0);
         let col_end = col_end.min(raster.cols() as i64 - 1);
         let row_start = row_start.max(0);
@@ -280,7 +525,7 @@ impl RasterSource {
     }
 
     fn valid_at(&self, band: usize, row: i64, col: i64) -> Option<f64> {
-        let raster = &self.bands[band];
+        let raster = self.band_opt(band)?;
         if row < 0 || col < 0 || row >= raster.rows() as i64 || col >= raster.cols() as i64 {
             return None;
         }
