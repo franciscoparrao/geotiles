@@ -7,9 +7,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use geotiles_core::{
-    CogCompression, CogOptions, ColorScheme, MbtilesSink, MvtOptions, PyramidOptions,
+    CogCompression, CogOptions, ColorScheme, MbtilesSink, MvtOptions, PmtilesSink, PyramidOptions,
     RasterSource, Resampling, SourceCrs, TileFormat, VectorSource, XyzSink, count_tiles, generate,
-    generate_mvt, write_cog, write_cog_rgb,
+    generate_mvt, pyramid_metadata, vector_layers_json, write_cog, write_cog_rgb,
 };
 
 #[derive(Parser)]
@@ -90,6 +90,10 @@ struct RasterArgs {
     /// Fixed stretch as MIN,MAX (default: data min/max).
     #[arg(long, value_parser = parse_range)]
     range: Option<(f64, f64)>,
+    /// Per-band stretch for RGB(A) as MIN,MAX;MIN,MAX;MIN,MAX (one pair per
+    /// colour band). Overrides --range.
+    #[arg(long)]
+    band_range: Option<String>,
     /// Layer name written to the output metadata (default: input stem).
     #[arg(long)]
     name: Option<String>,
@@ -182,6 +186,8 @@ enum FormatArg {
     Png,
     /// Lossless WebP — smaller than PNG, no quality loss.
     Webp,
+    /// Lossy JPEG — smallest tiles; transparency composited onto black.
+    Jpeg,
 }
 
 impl From<FormatArg> for TileFormat {
@@ -189,6 +195,7 @@ impl From<FormatArg> for TileFormat {
         match v {
             FormatArg::Png => TileFormat::Png,
             FormatArg::Webp => TileFormat::WebP,
+            FormatArg::Jpeg => TileFormat::Jpeg,
         }
     }
 }
@@ -224,6 +231,13 @@ fn parse_range(s: &str) -> Result<(f64, f64), String> {
     Ok((lo, hi))
 }
 
+/// Parse `MIN,MAX;MIN,MAX;MIN,MAX` into one stretch per band.
+fn parse_band_ranges(s: &str) -> Result<Vec<(f64, f64)>, String> {
+    s.split(';')
+        .map(|part| parse_range(part.trim()))
+        .collect()
+}
+
 fn parse_scheme(name: &str) -> Result<ColorScheme> {
     let wanted = name.to_lowercase();
     ColorScheme::ALL
@@ -248,9 +262,54 @@ fn validate_band_selection(bands: &[usize]) -> Result<()> {
 
 fn load_source(input: &Path, bands: &[usize], crs: Option<SourceCrs>) -> Result<RasterSource> {
     validate_band_selection(bands)?;
+    // Streaming first: open the GeoTIFF for its metadata and read each
+    // tile's source window on demand, so memory scales with the tile
+    // window instead of the whole raster. Falls back to full-RAM when the
+    // file lacks the geo-tags the windowed reader needs.
+    let zero_based: Vec<usize> = bands.iter().map(|&b| b - 1).collect();
+    match RasterSource::open_file(input, &zero_based, crs) {
+        Ok(src) => return Ok(src),
+        Err(e) => {
+            eprintln!(
+                "warning: streaming read unavailable ({e}); loading {} fully into memory",
+                input.display()
+            );
+        }
+    }
     let rasters = geotiles_core::read_bands(input, Some(bands))
         .with_context(|| format!("reading {}", input.display()))?;
     RasterSource::new_multi(rasters, crs).context("preparing raster source")
+}
+
+/// Output container selected by file extension.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputKind {
+    Mbtiles,
+    Pmtiles,
+    Xyz,
+}
+
+impl OutputKind {
+    /// Detect from the output file extension.
+    fn detect(path: &Path) -> Self {
+        match path
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("mbtiles") => OutputKind::Mbtiles,
+            Some("pmtiles") => OutputKind::Pmtiles,
+            _ => OutputKind::Xyz,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            OutputKind::Mbtiles => "MBTiles",
+            OutputKind::Pmtiles => "PMTiles",
+            OutputKind::Xyz => "XYZ",
+        }
+    }
 }
 
 fn cmd_raster(args: RasterArgs) -> Result<()> {
@@ -272,6 +331,12 @@ fn cmd_raster(args: RasterArgs) -> Result<()> {
         resampling: args.resample.into(),
         scheme: parse_scheme(&args.scheme)?,
         range: args.range,
+        band_ranges: args
+            .band_range
+            .as_deref()
+            .map(parse_band_ranges)
+            .transpose()
+            .map_err(anyhow::Error::msg)?,
         format: args.format.into(),
         name,
         ..Default::default()
@@ -286,23 +351,28 @@ fn cmd_raster(args: RasterArgs) -> Result<()> {
         .progress_chars("=> "),
     );
 
-    let is_mbtiles = args
-        .output
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("mbtiles"));
+    let sink_kind = OutputKind::detect(&args.output);
 
-    let stats = if is_mbtiles {
-        let mut sink = MbtilesSink::create(&args.output)?;
-        generate(&source, &opts, &mut sink, |done| pb.set_position(done))?
-    } else {
-        let mut sink = XyzSink::with_extension(&args.output, opts.format.as_str())?;
-        generate(&source, &opts, &mut sink, |done| pb.set_position(done))?
+    let stats = match sink_kind {
+        OutputKind::Mbtiles => {
+            let mut sink = MbtilesSink::create(&args.output)?;
+            generate(&source, &opts, &mut sink, |done| pb.set_position(done))?
+        }
+        OutputKind::Pmtiles => {
+            let mut sink = PmtilesSink::create(&args.output, opts.format.as_str())?;
+            sink.prepare(&pyramid_metadata(&source, &opts)?)?;
+            generate(&source, &opts, &mut sink, |done| pb.set_position(done))?
+        }
+        OutputKind::Xyz => {
+            let mut sink = XyzSink::with_extension(&args.output, opts.format.as_str())?;
+            generate(&source, &opts, &mut sink, |done| pb.set_position(done))?
+        }
     };
     pb.finish_and_clear();
 
     println!(
         "{}: {} tiles written, {} empty tiles skipped → {}",
-        if is_mbtiles { "MBTiles" } else { "XYZ" },
+        sink_kind.label(),
         stats.written,
         stats.skipped,
         args.output.display()
@@ -335,16 +405,14 @@ fn cmd_vector(args: VectorArgs) -> Result<()> {
 
     let name = args.name.clone().unwrap_or_else(|| first.name.clone());
 
-    let is_mbtiles = args
-        .output
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("mbtiles"));
+    let sink_kind = OutputKind::detect(&args.output);
     let opts = MvtOptions {
         min_zoom: args.min_zoom,
         max_zoom: args.max_zoom,
         simplify: args.simplify,
-        // Raw protobuf in XYZ trees so plain static servers work.
-        compress: is_mbtiles,
+        // gzip-compressed in MBTiles/PMTiles (convention); raw protobuf in
+        // XYZ trees so plain static servers work.
+        compress: sink_kind != OutputKind::Xyz,
         name,
         ..Default::default()
     };
@@ -357,12 +425,28 @@ fn cmd_vector(args: VectorArgs) -> Result<()> {
         opts.max_zoom
     );
 
-    let stats = if is_mbtiles {
-        let mut sink = MbtilesSink::create(&args.output)?;
-        generate_mvt(&source, &opts, &mut sink, |_| {})?
-    } else {
-        let mut sink = XyzSink::with_extension(&args.output, "pbf")?;
-        generate_mvt(&source, &opts, &mut sink, |_| {})?
+    let stats = match sink_kind {
+        OutputKind::Mbtiles => {
+            let mut sink = MbtilesSink::create(&args.output)?;
+            generate_mvt(&source, &opts, &mut sink, |_| {})?
+        }
+        OutputKind::Pmtiles => {
+            let mut sink = PmtilesSink::create(&args.output, "pbf")?;
+            let (w, s, e, n) = source.bounds_lonlat();
+            sink.prepare(&geotiles_core::PyramidMetadata {
+                name: opts.name.clone(),
+                bounds_lonlat: (w, s, e, n),
+                min_zoom: opts.min_zoom,
+                max_zoom: opts.max_zoom,
+                format: "pbf",
+                json: Some(vector_layers_json(&source, &opts)),
+            })?;
+            generate_mvt(&source, &opts, &mut sink, |_| {})?
+        }
+        OutputKind::Xyz => {
+            let mut sink = XyzSink::with_extension(&args.output, "pbf")?;
+            generate_mvt(&source, &opts, &mut sink, |_| {})?
+        }
     };
 
     println!(

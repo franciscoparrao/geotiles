@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Tile pyramid math, rendering, COG/MBTiles packaging and MVT encoding for geotiles"
+description = "Tile pyramid math, rendering, COG/MBTiles/PMTiles packaging, streaming I/O and MVT encoding for geotiles"
 keywords.workspace = true
 categories = ["science::geo"]
 readme = "README.md"
@@ -22,12 +22,19 @@ rusqlite.workspace = true
 flate2.workspace = true
 tiff.workspace = true
 image.workspace = true
+jpeg-encoder.workspace = true
+pmtiles.workspace = true
 mvt.workspace = true
 geo.workspace = true
 geo-types.workspace = true
-geojson.workspace = true
-serde_json.workspace = true
 rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+# Write shapefile fixtures in tests (same crate + version surtgis-core uses).
+shapefile = { version = "0.7", features = ["geo-types"] }
+# Write a non-point GeoParquet fixture (surtgis' writer is point-only).
+parquet = { version = "59", default-features = false }
+# Decode JPEG tiles in tests (image's jpeg feature pulls zune-jpeg, which
+# fails to build on rustc 1.96; jpeg-decoder is the classic pure-Rust one).
+jpeg-decoder = "0.3"

@@ -31,6 +31,7 @@ pub mod io;
 pub mod mbtiles;
 pub mod mercator;
 pub mod mvt;
+pub mod pmtiles;
 pub mod pyramid;
 pub mod source;
 pub mod vector;
@@ -38,12 +39,14 @@ pub mod xyz;
 
 pub use cog::{CogCompression, CogInfo, CogOptions, write_cog, write_cog_rgb};
 pub use error::{Error, Result};
-pub use io::{band_count, read_bands};
+pub use io::{WindowedMeta, band_count, read_band_window, read_bands, read_meta};
 pub use mbtiles::MbtilesSink;
 pub use mercator::{TileCoord, TileRange};
-pub use mvt::{MvtOptions, generate_mvt};
+pub use mvt::{MvtOptions, generate_mvt, vector_layers_json};
+pub use pmtiles::PmtilesSink;
 pub use pyramid::{
     PyramidMetadata, PyramidOptions, PyramidStats, TileFormat, TileSink, count_tiles, generate,
+    pyramid_metadata,
 };
 pub use source::{RasterSource, Resampling, SourceCrs};
 pub use vector::{VectorFeature, VectorLayer, VectorSource};

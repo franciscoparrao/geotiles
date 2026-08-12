@@ -6,13 +6,13 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.4.0"
 edition = "2024"
 authors = ["Francisco Parra"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/franciscoparrao/geotiles"
-description = "Web map tile generation in Rust: raster XYZ/MBTiles, COG, and MVT vector tiles"
-keywords = ["gis", "geospatial", "tiles", "mbtiles", "mvt"]
+description = "Web map tile generation in Rust: raster XYZ/MBTiles/PMTiles, COG, and MVT vector tiles"
+keywords = ["gis", "geospatial", "tiles", "mbtiles", "pmtiles", "mvt"]
 categories = ["science::geo", "command-line-utilities"]
 
 [workspace.dependencies]
@@ -20,13 +20,11 @@ thiserror = "2"
 anyhow = "1"
 
 # Ecosystem reuse (SurtGIS, published on crates.io)
-surtgis-core = { version = "0.15.4", default-features = false, features = ["geopackage"] }
-surtgis-colormap = "0.15.4"
+surtgis-core = { version = "1.2.2", default-features = false, features = ["geopackage", "parquet", "shapefile"] }
+surtgis-colormap = "1.0.0"
 
 # Vector tiles
 mvt = "0.13"
-geojson = { version = "1", features = ["geo-types"] }
-serde_json = "1"
 # geo must match surtgis-core's major (shared i_overlay/i_float tree).
 geo = "0.29"
 geo-types = "0.7"
@@ -38,6 +36,11 @@ flate2 = "1"
 tiff = { version = "0.10", features = ["deflate"] }
 # Pure-Rust lossless WebP tile encoding (no libwebp/C dependency).
 image = { version = "0.25", default-features = false, features = ["webp"] }
+# Pure-Rust lossy JPEG tile encoding (jpeg-encoder, not image's jpeg feature
+# which pulls zune-jpeg — that decoder fails to build on rustc 1.96).
+jpeg-encoder = "0.7"
+# PMTiles v3 single-file tile archive (canonical stadiamaps implementation).
+pmtiles = { version = "0.23", default-features = false, features = ["write"] }
 
 # Parallelism
 rayon = "1.10"

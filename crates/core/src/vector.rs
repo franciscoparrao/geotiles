@@ -129,73 +129,22 @@ impl VectorSource {
 
 /// Read any supported vector file into a `FeatureCollection`, dispatching
 /// by extension. `gpkg_layer` selects a GeoPackage table (default: first).
+///
+/// surtgis-core v1.0+ handles GeoJSON with all geometry types (including
+/// LineString and MultiPoint), so the custom parser is no longer needed.
+/// v1.1 adds Shapefile and full-geometry GeoParquet readers.
 fn read_file(path: &Path, gpkg_layer: Option<&str>) -> Result<FeatureCollection> {
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     match ext.as_str() {
+        "geojson" | "json" => Ok(surtgis_core::vector::read_geojson(path)?),
         "gpkg" => Ok(surtgis_core::vector::read_gpkg(path, gpkg_layer)?),
-        // Own GeoJSON reader: surtgis' parser lacks line geometries.
-        "geojson" | "json" => read_geojson(path),
+        "shp" => Ok(surtgis_core::vector::read_shapefile(path)?),
+        "parquet" => Ok(surtgis_core::vector::read_geoparquet(path)?),
         _ => Ok(surtgis_core::vector::read_vector(path)?),
     }
-}
-
-/// Spec-complete GeoJSON reader (all geometry types) on the `geojson`
-/// crate, normalized to surtgis' `FeatureCollection` model.
-fn read_geojson(path: &Path) -> Result<FeatureCollection> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|source| Error::Io { path: path.to_path_buf(), source })?;
-    let gj: geojson::GeoJson = text
-        .parse()
-        .map_err(|e| Error::InvalidInput(format!("{}: {e}", path.display())))?;
-
-    let features = match gj {
-        geojson::GeoJson::FeatureCollection(fc) => fc.features,
-        geojson::GeoJson::Feature(f) => vec![f],
-        geojson::GeoJson::Geometry(g) => vec![geojson::Feature {
-            bbox: None,
-            geometry: Some(g),
-            id: None,
-            properties: None,
-            foreign_members: None,
-        }],
-    };
-
-    let mut out = FeatureCollection::new();
-    for f in features {
-        let geometry = f
-            .geometry
-            .and_then(|g| Geometry::<f64>::try_from(g).ok());
-        let mut feature = match geometry {
-            Some(g) => surtgis_core::vector::Feature::new(g),
-            None => continue,
-        };
-        feature.id = f.id.map(|id| match id {
-            geojson::feature::Id::String(s) => s,
-            geojson::feature::Id::Number(n) => n.to_string(),
-        });
-        for (k, v) in f.properties.into_iter().flatten() {
-            let attr = match v {
-                serde_json::Value::Bool(b) => AttributeValue::Bool(b),
-                serde_json::Value::Number(n) => {
-                    if let Some(i) = n.as_i64() {
-                        AttributeValue::Int(i)
-                    } else {
-                        AttributeValue::Float(n.as_f64().unwrap_or(f64::NAN))
-                    }
-                }
-                serde_json::Value::String(s) => AttributeValue::String(s),
-                serde_json::Value::Null => AttributeValue::Null,
-                // Arrays/objects degrade to their JSON text.
-                other => AttributeValue::String(other.to_string()),
-            };
-            feature.set_property(k, attr);
-        }
-        out.push(feature);
-    }
-    Ok(out)
 }
 
 fn build_layer(
@@ -373,6 +322,227 @@ mod tests {
     #[test]
     fn rejects_empty_input() {
         assert!(VectorSource::from_collection("x", FeatureCollection::new(), None).is_err());
+    }
+
+    #[test]
+    fn reads_shapefile_input() {
+        // Build a .shp fixture with the shapefile crate (as surtgis tests do).
+        use shapefile::dbase::{FieldName, FieldValue, TableWriterBuilder};
+        use shapefile::{Point, PolygonRing, Writer};
+
+        let dir = tempfile::tempdir().unwrap();
+        let shp = dir.path().join("cuenca.shp");
+        let polygon = shapefile::Polygon::with_rings(vec![PolygonRing::Outer(vec![
+            Point::new(-71.5, -33.0),
+            Point::new(-71.0, -33.0),
+            Point::new(-71.0, -32.5),
+            Point::new(-71.5, -32.5),
+            Point::new(-71.5, -33.0),
+        ])]);
+        let table_builder = TableWriterBuilder::new()
+            .add_character_field(FieldName::try_from("name").unwrap(), 50);
+        let mut writer = Writer::from_path(&shp, table_builder).unwrap();
+        let mut record = shapefile::dbase::Record::default();
+        record.insert(
+            "name".to_string(),
+            FieldValue::Character(Some("Cuenca1".to_string())),
+        );
+        writer.write_shape_and_record(&polygon, &record).unwrap();
+        drop(writer);
+
+        // Without .prj the CRS must be inferred from the extent (lon/lat here).
+        let src = VectorSource::from_file(&shp, "cuencas", None, None).unwrap();
+        let layer = &src.layers()[0];
+        assert_eq!(layer.name, "cuencas");
+        assert_eq!(layer.features.len(), 1);
+        // The shapefile crate normalizes polygons to MultiPolygon.
+        assert!(matches!(layer.features[0].geometry, Geometry::MultiPolygon(_)));
+        let props = &layer.features[0].properties;
+        assert!(props.iter().any(|(k, v)| k == "name"
+            && matches!(v, AttributeValue::String(s) if s == "Cuenca1")));
+        // Reprojected to mercator → x is very negative.
+        let (x0, _, _, _) = src.bounds_meters();
+        assert!(x0 < -7.9e6, "expected mercator, got {x0}");
+    }
+
+    #[test]
+    fn reads_geoparquet_input() {
+        // surtgis' GeoParquet writer is point-only, so hand-write a
+        // LineString fixture using the parquet crate (dev-dependency).
+        use std::sync::Arc;
+        use parquet::basic::Repetition;
+        use parquet::data_type::ByteArray;
+        use parquet::file::metadata::KeyValue;
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::types::Type as SchemaType;
+        use parquet::data_type::ByteArrayType;
+        use parquet::basic::Compression;
+
+        // WKB LineString in lon/lat: LINESTRING(-71.4 -32.9, -71.2 -32.7)
+        let mut wkb = vec![1u8, 2, 0, 0, 0, 2, 0, 0, 0];
+        for (x, y) in [(-71.4f64, -32.9f64), (-71.2f64, -32.7f64)] {
+            wkb.extend_from_slice(&x.to_le_bytes());
+            wkb.extend_from_slice(&y.to_le_bytes());
+        }
+        let geo_meta = r#"{"version":"1.0.0","primary_column":"geometry",
+               "columns":{"geometry":{"encoding":"WKB",
+               "geometry_types":["LineString"],
+               "crs":"http://www.opengis.net/def/crs/EPSG/0/4326"}}}"#
+            .to_string();
+
+        let schema = Arc::new(
+            SchemaType::group_type_builder("schema")
+                .with_fields(vec![Arc::new(
+                    SchemaType::primitive_type_builder("geometry", parquet::basic::Type::BYTE_ARRAY)
+                        .with_repetition(Repetition::REQUIRED)
+                        .build()
+                        .unwrap(),
+                )])
+                .build()
+                .unwrap(),
+        );
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .set_key_value_metadata(Some(vec![KeyValue::new(
+                    "geo".to_string(),
+                    geo_meta,
+                )]))
+                .build(),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let pq = dir.path().join("red.parquet");
+        let file = std::fs::File::create(&pq).unwrap();
+        let mut writer = SerializedFileWriter::new(file, schema, props).unwrap();
+        let mut rg = writer.next_row_group().unwrap();
+        let mut col = rg.next_column().unwrap().unwrap();
+        col.typed::<ByteArrayType>()
+            .write_batch(&[ByteArray::from(wkb)], None, None)
+            .unwrap();
+        col.close().unwrap();
+        rg.close().unwrap();
+        writer.close().unwrap();
+
+        let src = VectorSource::from_file(&pq, "red", None, None).unwrap();
+        let layer = &src.layers()[0];
+        assert_eq!(layer.features.len(), 1);
+        assert!(matches!(layer.features[0].geometry, Geometry::LineString(_)));
+        // Reprojected to mercator.
+        let (x0, _, _, _) = src.bounds_meters();
+        assert!(x0 < -7.9e6, "expected mercator, got {x0}");
+    }
+
+    #[test]
+    fn reads_geoparquet_with_nullable_columns() {
+        // surtgis-core 1.2.0 tolerates nulls in GeoParquet attribute
+        // columns (geopandas writes these by default). Hand-write a fixture
+        // with one OPTIONAL string column where the first row is null.
+        use std::sync::Arc;
+        use parquet::basic::Repetition;
+        use parquet::data_type::{ByteArray, ByteArrayType};
+        use parquet::file::metadata::KeyValue;
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::types::Type as SchemaType;
+        use parquet::basic::Compression;
+
+        // WKB Point in lon/lat.
+        fn wkb_point(x: f64, y: f64) -> Vec<u8> {
+            let mut buf = vec![1u8, 1, 0, 0, 0];
+            buf.extend_from_slice(&x.to_le_bytes());
+            buf.extend_from_slice(&y.to_le_bytes());
+            buf
+        }
+        let geo_meta = r#"{"version":"1.0.0","primary_column":"geometry",
+               "columns":{"geometry":{"encoding":"WKB",
+               "geometry_types":["Point"],
+               "crs":"http://www.opengis.net/def/crs/EPSG/0/4326"}}}"#
+            .to_string();
+
+        let schema = Arc::new(
+            SchemaType::group_type_builder("schema")
+                .with_fields(vec![
+                    Arc::new(
+                        SchemaType::primitive_type_builder(
+                            "geometry",
+                            parquet::basic::Type::BYTE_ARRAY,
+                        )
+                        .with_repetition(Repetition::REQUIRED)
+                        .build()
+                        .unwrap(),
+                    ),
+                    Arc::new(
+                        SchemaType::primitive_type_builder(
+                            "estacion",
+                            parquet::basic::Type::BYTE_ARRAY,
+                        )
+                        .with_logical_type(Some(parquet::basic::LogicalType::String))
+                        .with_converted_type(parquet::basic::ConvertedType::UTF8)
+                        .with_repetition(Repetition::OPTIONAL)
+                        .build()
+                        .unwrap(),
+                    ),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .set_key_value_metadata(Some(vec![KeyValue::new(
+                    "geo".to_string(),
+                    geo_meta,
+                )]))
+                .build(),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let pq = dir.path().join("puntos_nulls.parquet");
+        let file = std::fs::File::create(&pq).unwrap();
+        let mut writer = SerializedFileWriter::new(file, schema, props).unwrap();
+        let mut rg = writer.next_row_group().unwrap();
+
+        // Column 0: two point geometries.
+        let mut col = rg.next_column().unwrap().unwrap();
+        col.typed::<ByteArrayType>()
+            .write_batch(
+                &[ByteArray::from(wkb_point(-71.0, -33.0)), ByteArray::from(wkb_point(-71.1, -33.1))],
+                None,
+                None,
+            )
+            .unwrap();
+        col.close().unwrap();
+
+        // Column 1: OPTIONAL string — first row null, second row "E01".
+        // Nulls don't consume a slot in the values batch, so only the
+        // present value is written, with a definition-level array [0,1].
+        let mut col = rg.next_column().unwrap().unwrap();
+        col.typed::<ByteArrayType>()
+            .write_batch(
+                &[ByteArray::from("E01")],
+                Some(&[0i16, 1i16]),
+                None,
+            )
+            .unwrap();
+        col.close().unwrap();
+
+        rg.close().unwrap();
+        writer.close().unwrap();
+
+        let src = VectorSource::from_file(&pq, "puntos", None, None).unwrap();
+        let layer = &src.layers()[0];
+        assert_eq!(layer.features.len(), 2);
+        // First feature carries AttributeValue::Null for `estacion`.
+        let null_feature = &layer.features[0];
+        assert!(null_feature.properties.iter().any(
+            |(k, v)| k == "estacion" && matches!(v, AttributeValue::Null)
+        ));
+        let named = &layer.features[1];
+        assert!(named.properties.iter().any(
+            |(k, v)| k == "estacion" && matches!(v, AttributeValue::String(s) if s == "E01")
+        ));
     }
 
     #[test]
