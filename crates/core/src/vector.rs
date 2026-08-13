@@ -101,6 +101,39 @@ impl VectorSource {
         self.push_layer(layer_name, fc, crs_override)
     }
 
+    /// Read a FlatGeobuf file into a single named layer, keeping only the
+    /// features intersecting `bbox` (in the file's own CRS).
+    ///
+    /// Uses the FGB R-tree index, so only matching features are decoded —
+    /// useful over large files when tiling a sub-region.
+    pub fn from_file_bbox(
+        path: impl AsRef<Path>,
+        layer_name: &str,
+        bbox: (f64, f64, f64, f64),
+        crs_override: Option<SourceCrs>,
+    ) -> Result<Self> {
+        let fc = read_flatgeobuf(path.as_ref(), Some(bbox))?;
+        Self::from_collection(layer_name, fc, crs_override)
+    }
+
+    /// Like [`VectorSource::from_file_bbox`], but appends to an existing
+    /// source as another named layer.
+    pub fn push_file_bbox(
+        &mut self,
+        path: impl AsRef<Path>,
+        layer_name: &str,
+        bbox: (f64, f64, f64, f64),
+        crs_override: Option<SourceCrs>,
+    ) -> Result<()> {
+        if self.layers.iter().any(|l| l.name == layer_name) {
+            return Err(Error::InvalidInput(format!(
+                "duplicate layer name {layer_name:?}"
+            )));
+        }
+        let fc = read_flatgeobuf(path.as_ref(), Some(bbox))?;
+        self.push_layer(layer_name, fc, crs_override)
+    }
+
     /// The layers, in encoding order.
     pub fn layers(&self) -> &[VectorLayer] {
         &self.layers
@@ -144,7 +177,7 @@ fn read_file(path: &Path, gpkg_layer: Option<&str>) -> Result<FeatureCollection>
         "gpkg" => Ok(surtgis_core::vector::read_gpkg(path, gpkg_layer)?),
         "shp" => Ok(surtgis_core::vector::read_shapefile(path)?),
         "parquet" => Ok(surtgis_core::vector::read_geoparquet(path)?),
-        "fgb" => read_flatgeobuf(path),
+        "fgb" => read_flatgeobuf(path, None),
         _ => Ok(surtgis_core::vector::read_vector(path)?),
     }
 }
@@ -155,7 +188,7 @@ fn read_file(path: &Path, gpkg_layer: Option<&str>) -> Result<FeatureCollection>
 /// decoded with geozero's `GeoWriter` (→ `geo_types::Geometry`) and its
 /// properties via a small `PropertyProcessor`. The file's CRS is read from
 /// the FGB header when it carries an EPSG code.
-fn read_flatgeobuf(path: &Path) -> Result<FeatureCollection> {
+fn read_flatgeobuf(path: &Path, bbox: Option<(f64, f64, f64, f64)>) -> Result<FeatureCollection> {
     use fallible_streaming_iterator::FallibleStreamingIterator;
     use geozero::geo_types::GeoWriter;
     use geozero::{FeatureProperties, GeozeroGeometry};
@@ -165,10 +198,18 @@ fn read_flatgeobuf(path: &Path) -> Result<FeatureCollection> {
         path: path.to_path_buf(),
         source,
     })?;
-    let mut fgb = flatgeobuf::FgbReader::open(BufReader::new(file))
-        .map_err(|e| Error::InvalidInput(format!("{}: {e}", path.display())))?
-        .select_all()
+    let reader = flatgeobuf::FgbReader::open(BufReader::new(file))
         .map_err(|e| Error::InvalidInput(format!("{}: {e}", path.display())))?;
+    // A bbox filter uses the file's R-tree (in the file's own CRS), so only
+    // features intersecting the box are decoded — streaming over large files.
+    let mut fgb = match bbox {
+        Some((min_x, min_y, max_x, max_y)) => reader
+            .select_bbox(min_x, min_y, max_x, max_y)
+            .map_err(|e| Error::InvalidInput(format!("{}: {e}", path.display())))?,
+        None => reader
+            .select_all()
+            .map_err(|e| Error::InvalidInput(format!("{}: {e}", path.display())))?,
+    };
 
     // CRS from the FGB header (EPSG code when available).
     let header = fgb.header();
@@ -678,6 +719,29 @@ mod tests {
         // Reprojected to mercator.
         let (x0, _, _, _) = src.bounds_meters();
         assert!(x0 < -7.9e6, "expected mercator, got {x0}");
+    }
+
+    #[test]
+    fn flatgeobuf_bbox_filter_keeps_intersecting_features() {
+        // pts_bbox.fgb has 5 points: 2 near lon -72..-72.5 (west), 3 near
+        // lon -70.5..-71 (east). A bbox over the east half must return only
+        // those 3.
+        let fgb_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pts_bbox.fgb");
+
+        let src =
+            VectorSource::from_file_bbox(&fgb_path, "pts", (-71.2, -33.2, -70.4, -32.4), None)
+                .unwrap();
+        let layer = &src.layers()[0];
+        assert_eq!(layer.features.len(), 3, "bbox filter should keep east points");
+        for f in &layer.features {
+            // In lon/lat source: x (west) should be > -71.2 (mercator).
+            assert!(
+                f.bbox.0 > mercator::lonlat_to_meters(-71.2, 0.0).0,
+                "kept a west feature: {:?}",
+                f.bbox
+            );
+        }
     }
 
     #[test]

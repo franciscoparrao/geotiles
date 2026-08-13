@@ -129,6 +129,13 @@ struct VectorArgs {
     /// Simplification tolerance in tile units (0 disables).
     #[arg(long, default_value_t = 1.0)]
     simplify: f64,
+    /// Drop the densest features in tiles that exceed --max-tile-size
+    /// (tippecanoe's --drop-densest-as-needed).
+    #[arg(long)]
+    drop_densest_as_needed: bool,
+    /// Encoded-tile budget in bytes before feature dropping kicks in.
+    #[arg(long, default_value_t = 500_000)]
+    max_tile_size: usize,
     /// Override CRS detection.
     #[arg(long, value_enum)]
     source_crs: Option<CrsArg>,
@@ -139,20 +146,38 @@ struct LayerSpec {
     name: String,
     path: PathBuf,
     gpkg_table: Option<String>,
+    /// FlatGeobuf R-tree filter (file CRS); only features intersecting the
+    /// box are read.
+    bbox: Option<(f64, f64, f64, f64)>,
 }
 
-/// Parse `[name=]path[#gpkg_table]`. The layer name defaults to the file
-/// stem; `#table` selects a GeoPackage table (lets one .gpkg supply
-/// several layers).
+/// Parse `[name=]path[#gpkg_table][#bbox=minx,miny,maxx,maxy]`. The layer
+/// name defaults to the file stem; `#table` selects a GeoPackage table;
+/// `#bbox=` filters a FlatGeobuf by its R-tree index (file CRS).
 fn parse_layer_spec(spec: &str) -> Result<LayerSpec> {
     let (name_opt, rest) = match spec.split_once('=') {
         Some((n, r)) => (Some(n.to_string()), r),
         None => (None, spec),
     };
-    let (path_str, gpkg_table) = match rest.split_once('#') {
-        Some((p, t)) => (p, Some(t.to_string())),
-        None => (rest, None),
-    };
+    let mut parts = rest.split('#');
+    let path_str = parts.next().unwrap_or_default();
+    let mut gpkg_table = None;
+    let mut bbox = None;
+    for part in parts {
+        if let Some(coords) = part.strip_prefix("bbox=") {
+            let v: Vec<f64> = coords
+                .split(',')
+                .map(|c| c.trim().parse())
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| anyhow::anyhow!("bad bbox in layer spec {spec:?}: {e}"))?;
+            if v.len() != 4 {
+                anyhow::bail!("bbox needs 4 numbers minx,miny,maxx,maxy in {spec:?}");
+            }
+            bbox = Some((v[0], v[1], v[2], v[3]));
+        } else {
+            gpkg_table = Some(part.to_string());
+        }
+    }
     if path_str.is_empty() {
         anyhow::bail!("empty path in layer spec {spec:?}");
     }
@@ -162,7 +187,7 @@ fn parse_layer_spec(spec: &str) -> Result<LayerSpec> {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "layer".into())
     });
-    Ok(LayerSpec { name, path, gpkg_table })
+    Ok(LayerSpec { name, path, gpkg_table, bbox })
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -390,17 +415,25 @@ fn cmd_vector(args: VectorArgs) -> Result<()> {
 
     // First spec seeds the source; the rest stack on as extra layers.
     let (first, rest) = specs.split_first().expect("clap guarantees >= 1 input");
-    let mut source = VectorSource::from_file(
-        &first.path,
-        &first.name,
-        first.gpkg_table.as_deref(),
-        crs,
-    )
-    .with_context(|| format!("reading {}", first.path.display()))?;
+    let mut source = match (first.bbox, first.gpkg_table.as_deref()) {
+        (Some(bbox), _) => VectorSource::from_file_bbox(&first.path, &first.name, bbox, crs)
+            .with_context(|| format!("reading {}", first.path.display()))?,
+        _ => VectorSource::from_file(
+            &first.path,
+            &first.name,
+            first.gpkg_table.as_deref(),
+            crs,
+        )
+        .with_context(|| format!("reading {}", first.path.display()))?,
+    };
     for spec in rest {
-        source
-            .push_file(&spec.path, &spec.name, spec.gpkg_table.as_deref(), crs)
-            .with_context(|| format!("reading {}", spec.path.display()))?;
+        let result = match (spec.bbox, spec.gpkg_table.as_deref()) {
+            (Some(bbox), _) => {
+                source.push_file_bbox(&spec.path, &spec.name, bbox, crs)
+            }
+            _ => source.push_file(&spec.path, &spec.name, spec.gpkg_table.as_deref(), crs),
+        };
+        result.with_context(|| format!("reading {}", spec.path.display()))?;
     }
 
     let name = args.name.clone().unwrap_or_else(|| first.name.clone());
@@ -413,6 +446,8 @@ fn cmd_vector(args: VectorArgs) -> Result<()> {
         // gzip-compressed in MBTiles/PMTiles (convention); raw protobuf in
         // XYZ trees so plain static servers work.
         compress: sink_kind != OutputKind::Xyz,
+        drop_densest: args.drop_densest_as_needed,
+        max_tile_bytes: args.max_tile_size,
         name,
         ..Default::default()
     };
