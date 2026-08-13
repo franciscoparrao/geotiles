@@ -11,7 +11,7 @@ use flate2::Compression as Flate;
 use flate2::write::GzEncoder;
 use geo::{BooleanOps, Simplify};
 use geo_types::{Geometry, LineString, MultiLineString, MultiPolygon, Polygon, Rect, polygon};
-use mvt::{GeomEncoder, GeomType, Tile as MvtTile};
+use mvt::{GeomData, GeomEncoder, GeomType, Tile as MvtTile};
 use surtgis_core::vector::AttributeValue;
 
 use crate::error::{Error, Result};
@@ -35,6 +35,14 @@ pub struct MvtOptions {
     /// gzip-compress encoded tiles (MBTiles convention). Disable for XYZ
     /// trees served by plain static file servers.
     pub compress: bool,
+    /// Drop the densest features when a tile exceeds `max_tile_bytes`
+    /// (tippecanoe's `--drop-densest-as-needed`). Features are ranked by
+    /// their footprint in the tile; the smallest-footprint (densest) are
+    /// dropped first so the tile stays under the budget.
+    pub drop_densest: bool,
+    /// Encoded-tile budget in bytes before feature dropping kicks in
+    /// (default 500 KB). Only used when `drop_densest` is true.
+    pub max_tile_bytes: usize,
     /// Tileset name for the output metadata.
     pub name: String,
 }
@@ -48,6 +56,8 @@ impl Default for MvtOptions {
             buffer: 64,
             simplify: 1.0,
             compress: true,
+            drop_densest: false,
+            max_tile_bytes: 500 * 1024,
             name: "geotiles".into(),
         }
     }
@@ -209,7 +219,20 @@ where
     Ok(stats)
 }
 
+/// One feature encoded for a tile, plus its drop density score.
+///
+/// `(layer name, mvt geometry, footprint score in tile units², id, properties)`.
+type EncodedFeature = (String, GeomData, f64, Option<u64>, Vec<(String, AttributeValue)>);
+
+/// Features of a single layer, ready to assemble into an MVT layer.
+type LayerFeatures = Vec<(GeomData, Option<u64>, Vec<(String, AttributeValue)>)>;
+
 /// Render one MVT tile; `None` when no feature intersects it.
+///
+/// When `drop_densest` is set and the encoded tile exceeds
+/// [`MvtOptions::max_tile_bytes`], features are dropped by footprint: the
+/// smallest features (in tile units) are removed first until the budget is
+/// met. This keeps low-zoom / dense tiles from blowing up.
 fn render_mvt_tile(
     source: &VectorSource,
     opts: &MvtOptions,
@@ -230,13 +253,12 @@ fn render_mvt_tile(
     let qx = |x: f64| (x - min_x) * scale;
     let qy = |y: f64| (max_y - y) * scale;
 
-    let mut tile = MvtTile::new(opts.extent);
-    let mut any_feature = false;
+    // Features encoded per layer: (layer name, mvt geometry data, density
+    // score = footprint in tile units, id, properties).
+    let mut encoded: Vec<EncodedFeature> =
+        Vec::new();
 
     for layer_def in source.layers() {
-        let mut layer = tile.create_layer(&layer_def.name);
-        let mut layer_used = false;
-
         for feature in &layer_def.features {
             if !bbox_intersects(feature.bbox, &clip_rect) {
                 continue;
@@ -263,11 +285,44 @@ fn render_mvt_tile(
             if data.is_empty() {
                 continue;
             }
+            // Density score: feature footprint in tile units². Small
+            // footprints (densest) get the smallest score and are dropped
+            // first. For point-like features the footprint is ~0.
+            let score = feature_footprint(feature, &clip_rect, qx, qy);
+            encoded.push((layer_def.name.clone(), data, score, feature.id, feature.properties.clone()));
+        }
+    }
+
+    if encoded.is_empty() {
+        return Ok(None);
+    }
+
+    // Budget enforcement: drop densest features until the encoded tile fits.
+    if opts.drop_densest && opts.max_tile_bytes > 0 {
+        drop_densest(&mut encoded, opts.max_tile_bytes);
+    }
+    if encoded.is_empty() {
+        return Ok(None);
+    }
+
+    let mut tile = MvtTile::new(opts.extent);
+    // Group features back into one layer per name (the encode loop collects
+    // per-feature, but MVT requires a single layer per name).
+    let mut by_layer: std::collections::BTreeMap<String, LayerFeatures> =
+        std::collections::BTreeMap::new();    for (layer_name, data, _, id, properties) in encoded {
+        by_layer
+            .entry(layer_name)
+            .or_default()
+            .push((data, id, properties));
+    }
+    for (layer_name, features) in by_layer {
+        let mut layer = tile.create_layer(&layer_name);
+        for (data, id, properties) in features {
             let mut mf = layer.into_feature(data);
-            if let Some(id) = feature.id {
+            if let Some(id) = id {
                 mf.set_id(id);
             }
-            for (k, v) in &feature.properties {
+            for (k, v) in &properties {
                 match v {
                     AttributeValue::Bool(b) => mf.add_tag_bool(k, *b),
                     AttributeValue::Int(i) => mf.add_tag_int(k, *i),
@@ -277,19 +332,11 @@ fn render_mvt_tile(
                 }
             }
             layer = mf.into_layer();
-            layer_used = true;
         }
-
-        if layer_used {
-            tile.add_layer(layer)
-                .map_err(|e| Error::Encode(format!("mvt layer: {e:?}")))?;
-            any_feature = true;
-        }
+        tile.add_layer(layer)
+            .map_err(|e| Error::Encode(format!("mvt layer: {e:?}")))?;
     }
 
-    if !any_feature {
-        return Ok(None);
-    }
     let bytes = tile.to_bytes().map_err(|e| Error::Encode(format!("mvt tile: {e:?}")))?;
     if !opts.compress {
         return Ok(Some(bytes));
@@ -299,6 +346,62 @@ fn render_mvt_tile(
         .and_then(|_| gz.finish())
         .map(Some)
         .map_err(|e| Error::Encode(format!("gzip: {e}")))
+}
+
+/// Footprint of a feature in tile units², used as its drop density score.
+///
+/// Points and tiny features get ~0 (dropped first); large polygons get a
+/// big score (kept). Based on the clipped bbox intersected with the tile.
+fn feature_footprint(
+    feature: &VectorFeature,
+    clip_rect: &Rect<f64>,
+    qx: impl Fn(f64) -> f64,
+    qy: impl Fn(f64) -> f64,
+) -> f64 {
+    let (min_x, min_y, max_x, max_y) = feature.bbox;
+    let x0 = min_x.max(clip_rect.min().x);
+    let y0 = min_y.max(clip_rect.min().y);
+    let x1 = max_x.min(clip_rect.max().x);
+    let y1 = max_y.min(clip_rect.max().y);
+    if x1 <= x0 || y1 <= y0 {
+        return 0.0;
+    }
+    (qx(x1) - qx(x0)).max(0.0) * (qy(y1) - qy(y0)).max(0.0)
+}
+
+/// Drop the densest (smallest-footprint) features until the total encoded
+/// size fits `budget` bytes. Sorts in place; `encoded` keeps insertion
+/// order afterwards (stable, so layers aren't reordered).
+fn drop_densest(encoded: &mut Vec<EncodedFeature>, budget: usize) {
+    if encoded.is_empty() {
+        return;
+    }
+    // Sort by footprint ascending (densest first), track original index.
+    let mut order: Vec<usize> = (0..encoded.len()).collect();
+    order.sort_by(|&a, &b| {
+        encoded[a]
+            .2
+            .partial_cmp(&encoded[b].2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    // GeomData.len() is in u32 words; the encoded protobuf is roughly 2-3
+    // bytes per word (varints) plus per-feature tag overhead. Estimate the
+    // total as len()*4 (upper bound) and drop until the estimate fits.
+    let cost = |gd: &GeomData| gd.len() * 4;
+    let total: usize = encoded.iter().map(|e| cost(&e.1)).sum();
+    if total <= budget {
+        return;
+    }
+    // Greedy: drop from the densest until the remaining total fits.
+    let mut remaining = total;
+    for &i in &order {
+        if remaining <= budget {
+            break;
+        }
+        remaining = remaining.saturating_sub(cost(&encoded[i].1));
+        encoded[i].2 = f64::NEG_INFINITY; // mark dropped
+    }
+    encoded.retain(|e| e.2.is_finite());
 }
 
 /// MVT geometry type plus its parts in integer tile coordinates
@@ -573,6 +676,60 @@ mod tests {
         let mut parts = vec![vec![(0i64, 0i64), (10, 0)], vec![(10, 0), (10, 10)]];
         avoid_shared_endpoints(&mut parts, false);
         assert_ne!(parts[1][0], parts[0][parts[0].len() - 1]);
+    }
+
+    #[test]
+    fn drop_densest_respects_tile_budget() {
+        // Many small polygons clustered in one tile. With a tiny budget the
+        // largest features survive and the total size stays under budget.
+        let mut fc = FeatureCollection::new();
+        for i in 0..200 {
+            let x0 = -71.5 + (i % 10) as f64 * 0.002;
+            let y0 = -33.0 + (i / 10) as f64 * 0.002;
+            // First 20 features are big; the rest are tiny.
+            let size = if i < 20 { 0.02 } else { 0.0002 };
+            let p = polygon![
+                (x: x0, y: y0), (x: x0 + size, y: y0),
+                (x: x0 + size, y: y0 + size), (x: x0, y: y0),
+            ];
+            let mut f = Feature::new(Geometry::Polygon(p));
+            f.set_property("i", AttributeValue::Int(i));
+            fc.push(f);
+        }
+        let src = VectorSource::from_collection("polys", fc, None).unwrap();
+
+        // Without dropping, the tile is large.
+        let opts_all = MvtOptions {
+            min_zoom: 11,
+            max_zoom: 11,
+            compress: false,
+            ..Default::default()
+        };
+        let mut sink_all = MemSink { tiles: HashMap::new(), meta: None };
+        generate_mvt(&src, &opts_all, &mut sink_all, |_| {}).unwrap();
+        let big = sink_all.tiles.values().next().expect("a tile");
+
+        // With a small budget, output must shrink and stay under budget.
+        let opts_drop = MvtOptions {
+            min_zoom: 11,
+            max_zoom: 11,
+            compress: false,
+            drop_densest: true,
+            max_tile_bytes: 2000,
+            ..Default::default()
+        };
+        let mut sink_drop = MemSink { tiles: HashMap::new(), meta: None };
+        generate_mvt(&src, &opts_drop, &mut sink_drop, |_| {}).unwrap();
+        let small = sink_drop.tiles.values().next().expect("a tile");
+
+        assert!(
+            small.len() < big.len(),
+            "dropping must shrink the tile: {} vs {}",
+            small.len(),
+            big.len()
+        );
+        // And it must fit the budget (protobuf overhead is small).
+        assert!(small.len() <= opts_drop.max_tile_bytes + 64, "over budget: {}", small.len());
     }
 
     #[test]
