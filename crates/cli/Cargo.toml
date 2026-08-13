@@ -18,6 +18,6 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 indicatif.workspace = true
-geotiles-core = { version = "0.4", path = "../core" }
+geotiles-core = { version = "0.5", path = "../core" }
 surtgis-core.workspace = true
 surtgis-colormap.workspace = true

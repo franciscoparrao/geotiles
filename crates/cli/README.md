@@ -6,8 +6,8 @@ rasters. A "tippecanoe lite" for the SurtGIS ecosystem — closes the loop
 
 ## Status
 
-v0.4 — raster (XYZ/MBTiles/PMTiles/COG, RGB, WebP/JPEG) and vector tiles
-(MVT) with streaming I/O.
+v0.5 — raster (XYZ/MBTiles/PMTiles/COG, RGB, WebP/JPEG) and vector tiles
+(MVT) with streaming I/O and feature dropping.
 
 - [x] Raster → XYZ tile tree (`z/x/y.png`) with resampling and full pyramid
 - [x] MBTiles 1.3 packaging (SQLite, TMS row order)
@@ -22,9 +22,13 @@ v0.4 — raster (XYZ/MBTiles/PMTiles/COG, RGB, WebP/JPEG) and vector tiles
 - [x] RGB(A) sources: multiband GeoTIFF reader, true-colour tiles
   (`--bands 1,2,3[,4]`, per-band stretch with `--band-range`) and byte
   RGB(A) COG output
-- [x] Vector tiles (MVT) from GeoJSON/GPKG/Shapefile/GeoParquet — clip,
-  per-zoom simplification, MBTiles (`pbf`+gzip) or XYZ `.pbf` tree;
+- [x] Vector tiles (MVT) from GeoJSON/GPKG/Shapefile/GeoParquet/FlatGeobuf —
+  clip, per-zoom simplification, MBTiles (`pbf`+gzip) or XYZ `.pbf` tree;
   matches GDAL's MVT output
+- [x] **Feature dropping** (`--drop-densest-as-needed`): keeps dense tiles
+  under a byte budget (tippecanoe-style)
+- [x] **FlatGeobuf R-tree bbox filter** (`#bbox=minx,miny,maxx,maxy`): read
+  only intersecting features from large files
 
 ## Install
 
@@ -61,9 +65,17 @@ geotiles vector cuencas.geojson -o cuencas.mbtiles --max-zoom 14
 geotiles vector cuencas.geojson red=hidro.gpkg#rios estaciones.geojson \
   -o hidrografia.mbtiles --name hidrografia
 
-# Vector/Shapefile/GeoParquet inputs
+# Vector/Shapefile/GeoParquet/FlatGeobuf inputs
 geotiles vector cuencas.shp rios=rios.geojson -o hidrografia.mbtiles
 geotiles vector hidrografia=hidrografia.parquet -o hidrografia.mbtiles
+geotiles vector hidrografia=hidrografia.fgb -o hidrografia.mbtiles
+
+# FlatGeobuf with an R-tree bbox filter (file CRS): only intersecting features
+geotiles vector "pts=big.fgb#bbox=-71.0,-33.0,-69.5,-31.5" -o east.mbtiles
+
+# Drop the densest features in tiles that exceed 100 KB (tippecanoe-style)
+geotiles vector dense.geojson -o dense.mbtiles \
+  --drop-densest-as-needed --max-tile-size 102400
 
 # PMTiles: single file for static hosting (serve with any Range-capable host)
 geotiles raster dem.tif -o dem.pmtiles --scheme terrain

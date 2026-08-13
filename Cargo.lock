@@ -575,7 +575,7 @@ dependencies = [
 
 [[package]]
 name = "geotiles"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -587,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "geotiles-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "fallible-streaming-iterator",
  "flate2",
